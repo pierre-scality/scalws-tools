@@ -38,79 +38,98 @@ class AWSManager:
                     return tag['Value']
         return 'N/A'
 
+    def _get_disk_details(self, instance):
+        """Gathers disk information for a given instance."""
+        disk_info = []
+        if 'BlockDeviceMappings' in instance:
+            volume_ids = [bd['Ebs']['VolumeId'] for bd in instance['BlockDeviceMappings'] if 'Ebs' in bd]
+            if volume_ids:
+                volumes_response = self.ec2.describe_volumes(VolumeIds=volume_ids)
+                volume_details = {vol['VolumeId']: f"{vol['Size']} GiB ({vol['VolumeType']})" for vol in volumes_response['Volumes']}
+                disk_info = [volume_details.get(vol_id, "N/A") for vol_id in volume_ids]
+        return ", ".join(disk_info) if disk_info else "N/A"
+
+    def _get_private_ips(self, instance):
+        """Gathers private IP addresses for a given instance."""
+        private_ips = []
+        if 'NetworkInterfaces' in instance:
+            for interface in instance['NetworkInterfaces']:
+                for ip_detail in interface.get('PrivateIpAddresses', []):
+                    private_ips.append(ip_detail['PrivateIpAddress'])
+        return private_ips
+
+    def _get_public_ips(self, instance):
+        """Gathers public IP addresses for a given instance."""
+        public_ips = []
+        if 'NetworkInterfaces' in instance:
+            for interface in instance['NetworkInterfaces']:
+                if 'Association' in interface and 'PublicIp' in interface['Association']:
+                    public_ips.append(interface['Association']['PublicIp'])
+        return public_ips
+
+    def _get_vpc_details(self, instance):
+        """Gathers VPC information for a given instance."""
+        vpc_id = instance.get('VpcId', 'N/A')
+        if vpc_id != 'N/A':
+            vpc_response = self.ec2.describe_vpcs(VpcIds=[vpc_id])
+            if vpc_response['Vpcs']:
+                vpc_name = self._get_tag_value(vpc_response['Vpcs'][0].get('Tags'), 'Name')
+                return f"{vpc_name} ({vpc_id})"
+        return 'N/A'
+
+    def _get_subnet_details(self, instance):
+        """Gathers subnet information for a given instance."""
+        subnets_info = []
+        if 'NetworkInterfaces' in instance:
+            for interface in instance.get('NetworkInterfaces', []):
+                subnet_id = interface.get('SubnetId', 'N/A')
+                if subnet_id != 'N/A':
+                    subnet_response = self.ec2.describe_subnets(SubnetIds=[subnet_id])
+                    if subnet_response['Subnets']:
+                        subnet_name = self._get_tag_value(subnet_response['Subnets'][0].get('Tags'), 'Name')
+                        subnets_info.append(f"{subnet_name} ({subnet_id})")
+                    else:
+                        subnets_info.append(f"N/A ({subnet_id})")
+                else:
+                    subnets_info.append('N/A')
+        return subnets_info
+
     def get_instances_by_owner(self, owner_email, show_network_info, show_disk_info):
-        """Retrieves data for EC2 instances belonging to a specific owner."""
+        """Retrieves data for EC2 instances by orchestrating helper methods."""
         instances_data = []
         try:
             response = self.ec2.describe_instances()
-            
             for reservation in response['Reservations']:
                 for instance in reservation['Instances']:
-                    owner = self._get_tag_value(instance.get('Tags'), 'owner')
+                    if self._get_tag_value(instance.get('Tags'), 'owner') != owner_email:
+                        continue
 
-                    if owner == owner_email:
-                        disk_info = []
-                        if 'BlockDeviceMappings' in instance:
-                            volume_ids = [bd['Ebs']['VolumeId'] for bd in instance['BlockDeviceMappings'] if 'Ebs' in bd]
-                            if volume_ids:
-                                volumes_response = self.ec2.describe_volumes(VolumeIds=volume_ids)
-                                volume_details = {vol['VolumeId']: f"{vol['Size']} GiB ({vol['VolumeType']})" for vol in volumes_response['Volumes']}
-                                disk_info = [volume_details.get(vol_id, "N/A") for vol_id in volume_ids]
-                        disks_str = ", ".join(disk_info) if disk_info else "N/A"
+                    instance_name = self._get_tag_value(instance.get('Tags'), 'Name')
+                    instance_id = instance['InstanceId']
 
-                        if show_disk_info:
-                            instance_info = {
-                                'ID': instance['InstanceId'],
-                                'Name': self._get_tag_value(instance.get('Tags'), 'Name'),
-                                'Disks': disks_str
-                            }
-                        else:
-                            name = self._get_tag_value(instance.get('Tags'), 'Name')
-                            private_ips = []
-                            if 'NetworkInterfaces' in instance:
-                                for interface in instance['NetworkInterfaces']:
-                                    for ip_detail in interface.get('PrivateIpAddresses', []):
-                                        private_ips.append(ip_detail['PrivateIpAddress'])
-                            
-                            public_ips = []
-                            if 'NetworkInterfaces' in instance:
-                                for interface in instance['NetworkInterfaces']:
-                                    if 'Association' in interface and 'PublicIp' in interface['Association']:
-                                        public_ips.append(interface['Association']['PublicIp'])
-
-                            instance_info = {
-                                'ID': instance['InstanceId'],
-                                'Name': name,
-                                'State': instance['State']['Name'],
-                                'Private IPs': ", ".join(private_ips) if private_ips else "N/A",
-                                'Public IPs': ", ".join(public_ips) if public_ips else "N/A",
-                            }
-
-                            if show_network_info:
-                                availability_zone = instance['Placement']['AvailabilityZone']
-                                vpc_id = instance.get('VpcId', 'N/A')
-                                vpc_name = 'N/A'
-                                if vpc_id != 'N/A':
-                                    vpc_response = self.ec2.describe_vpcs(VpcIds=[vpc_id])
-                                    if vpc_response['Vpcs']:
-                                        vpc_name = self._get_tag_value(vpc_response['Vpcs'][0].get('Tags'), 'Name')
-                                
-                                subnets_info = []
-                                for interface in instance.get('NetworkInterfaces', []):
-                                    subnet_id = interface.get('SubnetId', 'N/A')
-                                    subnet_name = 'N/A'
-                                    if subnet_id != 'N/A':
-                                        subnet_response = self.ec2.describe_subnets(SubnetIds=[subnet_id])
-                                        if subnet_response['Subnets']:
-                                            subnet_name = self._get_tag_value(subnet_response['Subnets'][0].get('Tags'), 'Name')
-                                    subnets_info.append(f"{subnet_name} ({subnet_id})")
-
-                                instance_info.update({
-                                    'AZ': availability_zone,
-                                    'VPC': f"{vpc_name} ({vpc_id})",
-                                    'Network': " | ".join(subnets_info)
-                                })
-                        instances_data.append(instance_info)
+                    if show_disk_info:
+                        instance_info = {
+                            'ID': instance_id,
+                            'Name': instance_name,
+                            'Disks': self._get_disk_details(instance)
+                        }
+                    else:
+                        private_ips = self._get_private_ips(instance)
+                        public_ips = self._get_public_ips(instance)
+                        instance_info = {
+                            'ID': instance_id,
+                            'Name': instance_name,
+                            'State': instance['State']['Name'],
+                            'Private IPs': ", ".join(private_ips) if private_ips else "N/A",
+                            'Public IPs': ", ".join(public_ips) if public_ips else "N/A",
+                        }
+                        if show_network_info:
+                            instance_info.update({
+                                'AZ': instance['Placement']['AvailabilityZone'],
+                                'VPC': self._get_vpc_details(instance),
+                                'Network': " | ".join(self._get_subnet_details(instance))
+                            })
+                    instances_data.append(instance_info)
             return instances_data
         except Exception as e:
             print(f"An error occurred while fetching instances: {e}")
