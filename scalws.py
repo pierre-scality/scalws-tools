@@ -129,6 +129,8 @@ class AWSManager:
                                 'VPC': self._get_vpc_details(instance),
                                 'Network': " | ".join(self._get_subnet_details(instance))
                             })
+                            del instance_info['State']
+                            del instance_info['ID']
                     instances_data.append(instance_info)
             return instances_data
         except Exception as e:
