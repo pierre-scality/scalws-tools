@@ -2,6 +2,7 @@
 import argparse
 import sys
 import boto3
+import re
 from botocore.exceptions import ClientError, NoCredentialsError, PartialCredentialsError
 
 DEFAULT_REGION = 'ap-northeast-1'
@@ -24,6 +25,12 @@ class Display:
     def query(self, message):
         self.display(message, level='QUERY')
         return input()
+
+    def print_query(self, message):
+        self.display(message, level='QUERY')
+
+    def raw(self, message):
+        print(message)
 
     @staticmethod
     def format_output_table(data):
@@ -241,7 +248,12 @@ class AWSManager:
                     else:
                         private_ips = self._get_private_ips(instance)
                         public_ips_info = self._get_public_ips(instance)
-                        public_ips_list = [f"{ip['ip']} auto" if not ip['is_eip'] else ip['ip'] for ip in public_ips_info]
+                        public_ips_list = []
+                        for ip_info in public_ips_info:
+                            ip_str = ip_info['ip']
+                            if not ip_info['is_eip'] and ip_info.get('is_from_auto_assign_subnet', False):
+                                ip_str += " auto"
+                            public_ips_list.append(ip_str)
 
                         instance_info = {
                             'ID': instance_id, 
@@ -259,6 +271,21 @@ class AWSManager:
             
             instances_data.sort(key=lambda x: x['Name'])
             return instances_data
+        except Exception as e:
+            self.display.display(f"An error occurred while fetching instances: {e}", level='INFO')
+            return []
+
+    def get_instances_by_regex(self, pattern):
+        """Retrieves instances owned by the owner that match a regex pattern."""
+        matching_instances = []
+        try:
+            response = self.ec2.describe_instances(Filters=[{'Name': 'tag:owner', 'Values': [self.owner]}])
+            for reservation in response['Reservations']:
+                for instance in reservation['Instances']:
+                    instance_name = self._get_tag_value(instance.get('Tags'), 'Name')
+                    if instance_name and re.search(pattern, instance_name):
+                        matching_instances.append(instance)
+            return matching_instances
         except Exception as e:
             self.display.display(f"An error occurred while fetching instances: {e}", level='INFO')
             return []
@@ -287,12 +314,32 @@ class AWSManager:
         """Gathers public IP addresses for a given instance and indicates if they are Elastic IPs."""
         public_ips_info = []
         if 'NetworkInterfaces' in instance:
+            subnet_ids = [ni.get('SubnetId') for ni in instance.get('NetworkInterfaces', []) if ni.get('SubnetId')]
+            subnet_map = {}
+            if subnet_ids:
+                try:
+                    subnet_responses = self.ec2.describe_subnets(SubnetIds=list(set(subnet_ids)))['Subnets']
+                    for subnet in subnet_responses:
+                        subnet_map[subnet['SubnetId']] = subnet
+                except ClientError:
+                    pass
+
             for interface in instance['NetworkInterfaces']:
                 association = interface.get('Association')
                 if association and 'PublicIp' in association:
-                    # An EIP has an 'AssociationId', an auto-assigned IP does not.
-                    is_eip = 'AssociationId' in association
-                    public_ips_info.append({'ip': association['PublicIp'], 'is_eip': is_eip})
+                    is_eip = 'AllocationId' in association
+                    
+                    is_from_auto_assign_subnet = False
+                    if not is_eip:
+                        subnet_id = interface.get('SubnetId')
+                        if subnet_id and subnet_id in subnet_map:
+                            is_from_auto_assign_subnet = subnet_map[subnet_id].get('MapPublicIpOnLaunch', False)
+                    
+                    public_ips_info.append({
+                        'ip': association['PublicIp'], 
+                        'is_eip': is_eip,
+                        'is_from_auto_assign_subnet': is_from_auto_assign_subnet
+                    })
         return public_ips_info
 
     def _get_vpc_details(self, instance):
@@ -560,6 +607,64 @@ class AWSManager:
         except Exception as e:
             self.display.display(f"An error occurred: {e}", level='INFO')
 
+class VMMgt:
+    def __init__(self, manager, display):
+        self.manager = manager
+        self.display = display
+
+    def _instance_action(self, expressions, action):
+        all_instances = []
+        instance_ids = set()
+
+        for expression in expressions:
+            instances = self.manager.get_instances_by_regex(expression)
+            for instance in instances:
+                if instance['InstanceId'] not in instance_ids:
+                    all_instances.append(instance)
+                    instance_ids.add(instance['InstanceId'])
+
+        if not all_instances:
+            self.display.display(f"No VMs found matching any of the expressions: '{' '.join(expressions)}'", level='INFO')
+            return
+
+        instance_ids_to_action = [instance['InstanceId'] for instance in all_instances]
+        instance_names = [self.manager._get_tag_value(instance.get('Tags'), 'Name') for instance in all_instances]
+
+        try:
+            self.display.print_query(f"Do you want to {action} these {len(all_instances)} vm(s)? (control c to abort) ")
+            self.display.raw(" ".join(instance_names))
+            input()
+        except KeyboardInterrupt:
+            self.display.display("\nOperation cancelled by user.", level='INFO')
+            sys.exit(1)
+
+        try:
+            if action == 'terminate':
+                confirm = self.display.query("do you really want to terminate? (y/n): ")
+                if confirm.lower() != 'y':
+                    self.display.display("Operation cancelled by user.", level='INFO')
+                    return
+
+            if action == 'start':
+                self.manager.ec2.start_instances(InstanceIds=instance_ids_to_action)
+            elif action == 'stop':
+                self.manager.ec2.stop_instances(InstanceIds=instance_ids_to_action)
+            elif action == 'terminate':
+                self.manager.ec2.terminate_instances(InstanceIds=instance_ids_to_action)
+            self.display.display(f"Successfully initiated {action} for {len(all_instances)} VMs.", level='INFO')
+        except ClientError as e:
+            self.display.display(f"An AWS error occurred: {e}", level='INFO')
+
+    def start(self, expressions):
+        self._instance_action(expressions, 'start')
+
+    def stop(self, expressions):
+        self._instance_action(expressions, 'stop')
+
+    def terminate(self, expressions):
+        self._instance_action(expressions, 'terminate')
+
+
 class Main:
     def __init__(self):
         self.parser = self._create_parser()
@@ -624,6 +729,13 @@ class Main:
         
         secg_parser = subparsers.add_parser('secg', help='Security Group related commands.')
 
+        start_parser = subparsers.add_parser('start', help='Start VMs.')
+        start_parser.add_argument('expressions', nargs='+', help="One or more regular expressions to match VM names.")
+        stop_parser = subparsers.add_parser('stop', help='Stop VMs.')
+        stop_parser.add_argument('expressions', nargs='+', help="One or more regular expressions to match VM names.")
+        terminate_parser = subparsers.add_parser('terminate', help='Terminate VMs.')
+        terminate_parser.add_argument('expressions', nargs='+', help="One or more regular expressions to match VM names.")
+
         return parser
 
     def run(self):
@@ -650,7 +762,7 @@ class Main:
         if args.debug:
             level = 'DEBUG'
 
-        if args.command in ['disk', 'eip'] and level == 'SILENT':
+        if args.command in ['disk', 'eip', 'start', 'stop', 'terminate'] and level == 'SILENT':
             level = 'INFO'
 
         display = Display(level=level)
@@ -667,6 +779,9 @@ class Main:
             'vpc': self.do_vpc,
             'eip': self.do_eip,
             'secg': self.do_secg,
+            'start': self.do_vm_action,
+            'stop': self.do_vm_action,
+            'terminate': self.do_vm_action,
         }
         
         command_func = command_map.get(args.command)
@@ -695,6 +810,16 @@ class Main:
             display.display(f"No security groups found for instances owned by {manager.owner} in region {manager.region}.", level='INFO')
         else:
             Display.format_output_table(sec_groups)
+
+    def do_vm_action(self, manager, display, args):
+        display.display(f"Entering do_vm_action for command: {args.command}", level='DEBUG')
+        vm_mgt = VMMgt(manager, display)
+        if args.command == 'start':
+            vm_mgt.start(args.expressions)
+        elif args.command == 'stop':
+            vm_mgt.stop(args.expressions)
+        elif args.command == 'terminate':
+            vm_mgt.terminate(args.expressions)
 
     def do_instances(self, manager, display, args):
         display.display(f"Entering do_instances for command: {args.instances_command}", level='DEBUG')

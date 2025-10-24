@@ -13,6 +13,19 @@
 
 The `scalws` tool uses subcommands to group related operations.
 
+### VM Management
+
+These commands allow you to manage your VMs.
+
+- `start <expression>`: Starts all VMs matching the regular expression.
+- `stop <expression>`: Stops all VMs matching the regular expression.
+- `terminate <expression>`: Terminates all VMs matching the regular expression.
+
+Example:
+```bash
+./scalws.py start "my-vm-.*"
+```
+
 ### Network
 
 The `network` subcommand is used for network-related operations.
