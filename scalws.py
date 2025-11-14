@@ -624,14 +624,14 @@ class VMMgt:
                     instance_ids.add(instance['InstanceId'])
 
         if not all_instances:
-            self.display.display(f"No VMs found matching any of the expressions: '{' '.join(expressions)}'", level='INFO')
+            self.display.display(f"No VMs found matching any of the expressions: '{' '.join(expressions)}'", level='ERROR')
             return
 
         instance_ids_to_action = [instance['InstanceId'] for instance in all_instances]
         instance_names = [self.manager._get_tag_value(instance.get('Tags'), 'Name') for instance in all_instances]
 
         try:
-            self.display.print_query(f"Do you want to {action} these {len(all_instances)} vm(s)? (control c to abort) ")
+            self.display.print_query(f"Do you want to {action} these {len(all_instances)} vm(s)? (Enter to confirm/Ctl C to abort) \n")
             self.display.raw(" ".join(instance_names))
             input()
         except KeyboardInterrupt:
