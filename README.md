@@ -1,21 +1,37 @@
 # scalws-tools
 
-`scalws` is a command-line tool for interacting with Scaleway services.
+`scalws` is a command-line tool for interacting with AWS services, tailored for Scality use cases.
 
 ## Installation
 
-1.  Make sure you have Python 3 installed.
-2.  Clone this repository: `git clone https://github.com/your-username/scalws-tools.git`
-3.  Navigate to the project directory: `cd scalws-tools`
+1.  Make sure you have Python 3 and `boto3` installed (`pip install boto3`).
+2.  Clone this repository.
+3.  Navigate to the project directory.
 4.  Make the script executable: `chmod +x scalws.py`
+
+## Configuration
+
+- **AWS Credentials**: The script requires AWS credentials to be configured in your environment (e.g., via `~/.aws/credentials` or environment variables).
+- **Default Owner**: The default owner for resources is `pierre.merle@scality.com`. You can override this with the `-o` or `--owner` flag.
+- **Default Region**: The default region is `ap-northeast-1`. You can override this with the `-r` or `--region` flag.
 
 ## Usage
 
 The `scalws` tool uses subcommands to group related operations.
 
-### VM Management
+### General Options
 
-These commands allow you to manage your VMs.
+- `-r, --region`: Specify the AWS region.
+- `-o, --owner`: Specify the owner's email.
+- `-v, --verbose`: Enable verbose output.
+- `-d, --debug`: Enable debug output.
+
+### Instances (`instances`)
+
+- `instances list` (default command): List EC2 instances with basic info.
+- `instances disks <instance_name>`: List disks attached to a specific instance.
+
+### VM Management (`start`, `stop`, `terminate`)
 
 - `start <expression>`: Starts all VMs matching the regular expression.
 - `stop <expression>`: Stops all VMs matching the regular expression.
@@ -26,37 +42,32 @@ Example:
 ./scalws.py start "my-vm-.*"
 ```
 
-### Network
+### Disk Management (`disk`)
 
-The `network` subcommand is used for network-related operations.
+- `disk list`: List all EBS volumes.
+- `disk create <pattern> <start> <end> [--size <GiB>] [--type <type>]`: Create EBS volumes.
+- `disk delete --pattern <pattern> [numbers...]` or `disk delete --volume-id <volume-id>`: Delete EBS volumes.
+- `disk attach <vm_name>`: Attach available volumes to an instance.
+- `disk new`: List unattached disks.
 
-#### Add a network
+### Network Management (`network`)
 
-To add a new network, use the `add` subcommand:
+- `network list`: List instances with detailed network info.
+- `network interface`: List network interfaces.
 
-```bash
-./scalws.py network add <network-name>
-```
+### VPC Management (`vpc`)
 
-### VPC
+- `vpc list`: List Scality VPCs and their subnets.
 
-The `vpc` subcommand is used for VPC-related operations.
+### Elastic IP Management (`eip`)
 
-#### Add a VPC
+- `eip list`: List all EIPs.
+- `eip attach <ip_address> <instance_name>`: Attach an EIP to an instance.
+- `eip detach <ip_address>`: Detach an EIP from an instance.
 
-To add a new VPC, use the `add` subcommand:
+### Security Group Management (`secg`)
 
-```bash
-./scalws.py vpc add <vpc-name>
-```
-
-#### Delete a VPC
-
-To delete a VPC, use the `delete` subcommand:
-
-```bash
-./scalws.py vpc delete <vpc-name>
-```
+- `secg`: List security groups for owned instances.
 
 ## Autocompletion
 
