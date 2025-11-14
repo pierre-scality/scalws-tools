@@ -31,9 +31,11 @@ The `scalws` tool uses subcommands to group related operations. There are two ma
 
 These commands allow you to manage the lifecycle of your VMs.
 
-- `start <expression>`: Starts all VMs matching the regular expression.
-- `stop <expression>`: Stops all VMs matching the regular expression.
-- `terminate <expression>`: Terminates all VMs matching the regular expression.
+- `start <expression>`: Starts all VMs matching the string
+- `stop <expression>`: Stops all VMs matching the string
+- `terminate <expression>`: Terminates all VMs matching string
+
+The regex is matching the full string against all vm.
 
 Example:
 ```bash
