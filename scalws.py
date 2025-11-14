@@ -12,14 +12,14 @@ class Display:
     """Handles formatting and printing data to the console."""
     def __init__(self, level='SILENT'):
         self.level = level
-        self.levels = {'DEBUG': 3, 'VERBOSE': 2, 'INFO': 1, 'SILENT': 0}
+        self.levels = {'ERROR': 4, 'DEBUG': 3, 'VERBOSE': 2, 'INFO': 1, 'SILENT': 0}
 
     def display(self, message, level='INFO'):
         if level == 'QUERY':
             print(f"QUERY: {message}", end='')
             return
         
-        if self.levels.get(self.level, 0) >= self.levels.get(level, 1):
+        if level == 'ERROR' or self.levels.get(self.level, 0) >= self.levels.get(level, 1):
             print(f"{level}: {message}")
 
     def query(self, message):
@@ -63,14 +63,14 @@ class AWSManager:
             self.ec2 = boto3.client('ec2', region_name=self.region)
             self.ec2.describe_regions()
         except (NoCredentialsError, PartialCredentialsError):
-            self.display.display("Authentication Error: AWS credentials not found or incomplete.", level='INFO')
+            self.display.display("Authentication Error: AWS credentials not found or incomplete. Have you set the AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and (if necessary) AWS_SESSION_TOKEN environment variables?", level='ERROR')
             sys.exit(1)
         except ClientError as e:
             if e.response['Error']['Code'] == 'AuthFailure':
-                self.display.display("Authentication Error: The provided AWS credentials could not be validated.", level='INFO')
+                self.display.display("Authentication Error: The provided AWS credentials could not be validated.", level='ERROR')
                 sys.exit(1)
             else:
-                self.display.display(f"An AWS service error occurred: {e}", level='INFO')
+                self.display.display(f"An AWS service error occurred: {e}", level='ERROR')
                 sys.exit(1)
 
     def _get_tag_value(self, tags, key):
@@ -745,16 +745,11 @@ class Main:
             args.command = 'instances'
             args.instances_command = 'list'
         
-        if args.command == 'instances' and args.instances_command is None:
-            args.instances_command = 'list'
-        elif args.command == 'network' and args.network_command is None:
-            args.network_command = 'list'
-        elif args.command == 'disk' and args.disk_command is None:
-            args.disk_command = 'list'
-        elif args.command == 'vpc' and args.vpc_command is None:
-            args.vpc_command = 'list'
-        elif args.command == 'eip' and args.eip_command is None:
-            args.eip_command = 'list'
+        # Default to 'list' for commands that have it and are called without a subcommand
+        if args.command:
+            subcommand_dest = f"{args.command}_command"
+            if hasattr(args, subcommand_dest) and getattr(args, subcommand_dest) is None:
+                setattr(args, subcommand_dest, 'list')
         
         level = 'SILENT'
         if args.verbose:

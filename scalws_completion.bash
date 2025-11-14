@@ -1,81 +1,54 @@
-#compdef scalws.py
-# Run something, muting output or redirecting it to the debug stream
-# depending on the value of _ARC_DEBUG.
-# If ARGCOMPLETE_USE_TEMPFILES is set, use tempfiles for IPC.
-__python_argcomplete_run() {
-    if [[ -z "${ARGCOMPLETE_USE_TEMPFILES-}" ]]; then
-        __python_argcomplete_run_inner "$@"
-        return
+_scalws_completion() {
+    local cur prev words cword
+    _init_completion -n : || return
+
+    cur="${COMP_WORDS[COMP_CWORD]}"
+    prev="${COMP_WORDS[COMP_CWORD-1]}"
+
+    local commands="instances network disk vpc eip secg start stop terminate"
+    local instances_subcommands="list disks"
+    local network_subcommands="list interface"
+    local disk_subcommands="list attach create delete new"
+    local vpc_subcommands="list"
+    local eip_subcommands="list attach detach"
+    local general_opts="-r --region -v --verbose -d --debug -o --owner -z --availability-zone -h --help"
+
+    if [[ ${COMP_CWORD} -eq 1 ]] ; then
+        COMPREPLY=( $(compgen -W "${commands} ${general_opts}" -- ${cur}) )
+        return 0
     fi
-    local tmpfile="$(mktemp)"
-    _ARGCOMPLETE_STDOUT_FILENAME="$tmpfile" __python_argcomplete_run_inner "$@"
-    local code=$?
-    cat "$tmpfile"
-    rm "$tmpfile"
-    return $code
+
+    local command="${COMP_WORDS[1]}"
+    case "${command}" in
+        instances)
+            if [[ ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${instances_subcommands}" -- ${cur}) )
+            fi
+            ;;
+        network)
+            if [[ ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${network_subcommands}" -- ${cur}) )
+            fi
+            ;;
+        disk)
+            if [[ ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${disk_subcommands}" -- ${cur}) )
+            fi
+            ;;
+        vpc)
+            if [[ ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${vpc_subcommands}" -- ${cur}) )
+            fi
+            ;;
+        eip)
+            if [[ ${COMP_CWORD} -eq 2 ]] ; then
+                COMPREPLY=( $(compgen -W "${eip_subcommands}" -- ${cur}) )
+            fi
+            ;;
+        start|stop|terminate|secg)
+            # No subcommands for these
+            ;;
+    esac
 }
 
-__python_argcomplete_run_inner() {
-    if [[ -z "${_ARC_DEBUG-}" ]]; then
-        "$@" 8>&1 9>&2 1>/dev/null 2>&1 </dev/null
-    else
-        "$@" 8>&1 9>&2 1>&9 2>&1 </dev/null
-    fi
-}
-
-_python_argcomplete() {
-    local IFS=$'\013'
-    local script=""
-    if [[ -n "${ZSH_VERSION-}" ]]; then
-        local completions
-        completions=($(IFS="$IFS" \
-            COMP_LINE="$BUFFER" \
-            COMP_POINT="$CURSOR" \
-            _ARGCOMPLETE=1 \
-            _ARGCOMPLETE_SHELL="zsh" \
-            _ARGCOMPLETE_SUPPRESS_SPACE=1 \
-            __python_argcomplete_run ${script:-${words[1]}}))
-        local nosort=()
-        local nospace=()
-        if is-at-least 5.8; then
-            nosort=(-o nosort)
-        fi
-        if [[ "${completions-}" =~ ([^\\]): && "${match[1]}" =~ [=/:] ]]; then
-            nospace=(-S '')
-        fi
-        _describe "${words[1]}" completions "${nosort[@]}" "${nospace[@]}"
-    else
-        local SUPPRESS_SPACE=0
-        if compopt +o nospace 2> /dev/null; then
-            SUPPRESS_SPACE=1
-        fi
-        COMPREPLY=($(IFS="$IFS" \
-            COMP_LINE="$COMP_LINE" \
-            COMP_POINT="$COMP_POINT" \
-            COMP_TYPE="$COMP_TYPE" \
-            _ARGCOMPLETE_COMP_WORDBREAKS="$COMP_WORDBREAKS" \
-            _ARGCOMPLETE=1 \
-            _ARGCOMPLETE_SHELL="bash" \
-            _ARGCOMPLETE_SUPPRESS_SPACE=$SUPPRESS_SPACE \
-            __python_argcomplete_run ${script:-$1}))
-        if [[ $? != 0 ]]; then
-            unset COMPREPLY
-        elif [[ $SUPPRESS_SPACE == 1 ]] && [[ "${COMPREPLY-}" =~ [=/:]$ ]]; then
-            compopt -o nospace
-        fi
-    fi
-}
-if [[ -z "${ZSH_VERSION-}" ]]; then
-    complete -o nospace -o default -o bashdefault -F _python_argcomplete scalws.py
-else
-    # When called by the Zsh completion system, this will end with
-    # "loadautofunc" when initially autoloaded and "shfunc" later on, otherwise,
-    # the script was "eval"-ed so use "compdef" to register it with the
-    # completion system
-    autoload is-at-least
-    if [[ $zsh_eval_context == *func ]]; then
-        _python_argcomplete "$@"
-    else
-        compdef _python_argcomplete scalws.py
-    fi
-fi
+complete -F _scalws_completion scalws.py

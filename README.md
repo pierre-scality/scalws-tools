@@ -17,7 +17,7 @@
 
 ## Usage
 
-The `scalws` tool uses subcommands to group related operations.
+The `scalws` tool uses subcommands to group related operations. There are two main types of actions: VM management and resource management.
 
 ### General Options
 
@@ -25,13 +25,11 @@ The `scalws` tool uses subcommands to group related operations.
 - `-o, --owner`: Specify the owner's email.
 - `-v, --verbose`: Enable verbose output.
 - `-d, --debug`: Enable debug output.
+- `-z, --availability-zone`: The Availability Zone for resource creation.
 
-### Instances (`instances`)
+### VM Management
 
-- `instances list` (default command): List EC2 instances with basic info.
-- `instances disks <instance_name>`: List disks attached to a specific instance.
-
-### VM Management (`start`, `stop`, `terminate`)
+These commands allow you to manage the lifecycle of your VMs.
 
 - `start <expression>`: Starts all VMs matching the regular expression.
 - `stop <expression>`: Stops all VMs matching the regular expression.
@@ -39,10 +37,25 @@ The `scalws` tool uses subcommands to group related operations.
 
 Example:
 ```bash
-./scalws.py start "my-vm-.*"
+./scalws.py start start 943
+QUERY: Do you want to start these 5 vm(s)? (Enter to confirm/Ctl C to abort) 
+pme_943_supervisor pme_943_store-3 pme_943_store-1 pme_943_store-2 pme_943_client
+
 ```
 
-### Disk Management (`disk`)
+It will match all VM belonging to the owner and propose to start them. Just hit enter to run the action. Same for Stop. For Terminate there will be confirmations.
+The pattern matching only works for stop/start/terminate.
+
+### Resource Management
+
+These commands allow you to manage various AWS resources.
+
+#### Instances (`instances`)
+
+- `instances list` (default command): List EC2 instances with basic info.
+- `instances disks <instance_name>`: List disks attached to a specific instance.
+
+#### Disk Management (`disk`)
 
 - `disk list`: List all EBS volumes.
 - `disk create <pattern> <start> <end> [--size <GiB>] [--type <type>]`: Create EBS volumes.
@@ -50,22 +63,31 @@ Example:
 - `disk attach <vm_name>`: Attach available volumes to an instance.
 - `disk new`: List unattached disks.
 
-### Network Management (`network`)
+Example: Create 12 disks and attach them to 'my-vm'.
+```bash
+./scalws.py disk create my-vm-disk- 1 12 --size 100 --type gp3
+./scalws.py disk attach my-vm
+```
+
+#### Network Management (`network`)
 
 - `network list`: List instances with detailed network info.
 - `network interface`: List network interfaces.
 
-### VPC Management (`vpc`)
+#### VPC Management (`vpc`)
 
 - `vpc list`: List Scality VPCs and their subnets.
 
-### Elastic IP Management (`eip`)
+#### Elastic IP Management (`eip`)
 
 - `eip list`: List all EIPs.
 - `eip attach <ip_address> <instance_name>`: Attach an EIP to an instance.
 - `eip detach <ip_address>`: Detach an EIP from an instance.
 
-### Security Group Management (`secg`)
+Unlike other commands eip list all eip with owner. You can then attach a free ip to your instance
+
+
+#### Security Group Management (`secg`)
 
 - `secg`: List security groups for owned instances.
 
