@@ -1,9 +1,16 @@
 # scalws-tools
 
+There are 2 tools to manage AWS machines. 
+
 `scalws` is a command-line tool for interacting with AWS services :
 -  Simplify start/stop of group of machines by using pattern matching 
 -  Get various informations on network/vpc/eip difficult to get all together in the UI 
 -  Create/Attach/Detach/Delete bunch of disks of an instance (typically to test disk addition)
+
+`labws` is an helper to create and configure artesca labs. 
+-   Launch a bunch of machine is one command
+-   Configure passwd and set up hostname/timezone 
+-   Show lab configuration 
 
 
 ## Configuration
@@ -12,7 +19,7 @@
 - **Default Owner**: The default owner for resources is `pierre.merle@scality.com`. You can override this with the `-o` or `--owner` flag.
 - **Default Region**: The default region is `ap-northeast-1`. You can override this with the `-r` or `--region` flag.
 
-## Usage
+## Usage - SCALWS
 
 The `scalws` tool uses subcommands to group related operations. There are two main types of actions: VM management and resource management.
 
@@ -104,3 +111,46 @@ To enable bash autocompletion, source the `scalws_completion.bash` file in your 
 ```bash
 echo "source $(pwd)/scalws_completion.bash" >> ~/.bashrc
 ```
+
+## Usage - LABWS
+
+### `labws.py`
+
+This script is used to manage lab environments, specifically for creating, showing, and configuring EC2 instances from a template.
+
+#### Subcommands
+
+##### `build`
+
+Creates and configures a specified number of EC2 instances. It checks for existing instances with the same name and will not create duplicates.
+
+*   **Usage:** `./labws.py build -c <count> [-x <prefix>] [-p <pattern>]`
+*   **Arguments:**
+    *   `-c, --count`: (Required) The number of machines to create.
+    *   `-x, --prefix`: The prefix for the instance names. If not provided, a prefix is generated from the owner's email (e.g., 'pme').
+    *   `-p, --pattern`: The pattern for the instance names. Defaults to 'vm'.
+*   **Example:** `./labws.py build -c 2 -x pme -p lab` will create two instances named `pme-lab-01` and `pme-lab-02`.
+
+##### `show`
+
+Displays information about existing lab resources. By default, it shows instances and their status, including hostname and timezone information retrieved via SSH.
+
+*   **Usage:** `./labws.py show [-x <prefix>] [-p <pattern>] [-e]`
+*   **Arguments:**
+    *   `-x, --prefix`: The prefix to filter by.
+    *   `-p, --pattern`: The pattern to filter by. Defaults to 'vm'.
+    *   `-e, --eip`: If specified, lists Elastic IPs instead of instances.
+*   **Example:** `./labws.py show -x pme -p lab` will show instances matching the prefix 'pme' and pattern 'lab'.
+
+##### `configure`
+
+Configures one or more existing instances based on their prefix and pattern. This command performs the following actions on each matching instance:
+1.  Handles the initial forced password change for the `artesca-os` user.
+2.  Sets the instance hostname to match its `Name` tag.
+3.  Sets the timezone to the default value.
+
+*   **Usage:** `./labws.py configure [-x <prefix>] [-p <pattern>]`
+*   **Arguments:**
+    *   `-x, --prefix`: The prefix of the instances to configure.
+    *   `-p, --pattern`: The pattern of the instances to configure. Defaults to 'vm'.
+*   **Example:** `./labws.py configure -x pme -p lab` will run the configuration process on all instances matching the prefix 'pme' and pattern 'lab'.
