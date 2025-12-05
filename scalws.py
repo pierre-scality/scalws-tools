@@ -130,18 +130,27 @@ class AWSManager:
         
         self.display.display(f"Successfully initiated creation for {len(target_names)} disks.", level='INFO')
 
-    def delete_disks(self, pattern, numbers, volume_id, owner):
+    def delete_disks(self, pattern, numbers, volume_ids_list, owner):
         """Deletes EBS volumes after confirmation."""
         disks_to_delete = []
         try:
-            if volume_id:
-                response = self.ec2.describe_volumes(VolumeIds=[volume_id])
+            if volume_ids_list:
+                # Describe all provided volume IDs
+                response = self.ec2.describe_volumes(VolumeIds=volume_ids_list)
                 all_volumes = response['Volumes']
-                # Ensure the volume belongs to the owner before deletion
-                disks_to_delete = [vol for vol in all_volumes if self._get_tag_value(vol.get('Tags'), 'owner') == owner]
-                if not disks_to_delete:
-                    self.display.display(f"Error: Volume ID '{volume_id}' not found or does not belong to owner {owner}.", level='INFO')
+                
+                # Filter volumes that belong to the owner
+                owner_volumes = [vol for vol in all_volumes if self._get_tag_value(vol.get('Tags'), 'owner') == owner]
+                
+                # Check for volumes not found or not owned
+                found_volume_ids = {vol['VolumeId'] for vol in owner_volumes}
+                not_found_or_not_owned = [vid for vid in volume_ids_list if vid not in found_volume_ids]
+
+                if not_found_or_not_owned:
+                    self.display.display(f"Error: The following Volume IDs were not found or do not belong to owner {owner}: {', '.join(not_found_or_not_owned)}", level='INFO')
                     sys.exit(1)
+                
+                disks_to_delete = owner_volumes
             else:
                 paginator = self.ec2.get_paginator('describe_volumes')
                 pages = paginator.paginate(Filters=[{'Name': 'tag:owner', 'Values': [owner]}])
@@ -444,6 +453,7 @@ class AWSManager:
             eips_data = []
             for addr in addresses:
                 instance_id = addr.get('InstanceId')
+                eip_name = self._get_tag_value(addr.get('Tags', []), 'Name') # Get the EIP name
                 if instance_id:
                     details = instance_details.get(instance_id, {})
                     status = f"{details.get('PrivateIpAddress', 'N/A')} / {details.get('Name', 'N/A')}"
@@ -453,6 +463,7 @@ class AWSManager:
                     owner = 'N/A'
                 
                 eips_data.append({
+                    'Name': eip_name, # Add EIP Name here
                     'EIP': addr['PublicIp'],
                     'AllocationId': addr['AllocationId'],
                     'Status': status,
@@ -536,7 +547,7 @@ class AWSManager:
         try:
             response = self.ec2.describe_volumes(Filters=[{'Name': 'status', 'Values': ['available']}, {'Name': 'tag:owner', 'Values': [self.owner]}])
             for volume in response['Volumes']:
-                disks_data.append({'Name': self._get_tag_value(volume.get('Tags'), 'Name'), 'ID': volume['VolumeId'], 'Size': f"{volume['Size']} GiB"})
+                disks_data.append({'Instance Name': 'Unattached', 'ID': volume['VolumeId'], 'Size': f"{volume['Size']} GiB"})
             return disks_data
         except Exception as e:
             self.display.display(f"An error occurred while fetching unattached volumes: {e}", level='INFO')
@@ -710,7 +721,7 @@ class Main:
         delete_parser = disk_subparsers.add_parser('delete', help='Delete disks.')
         delete_group = delete_parser.add_mutually_exclusive_group(required=True)
         delete_group.add_argument('--pattern', help="The naming pattern or prefix.")
-        delete_group.add_argument('--volume-id', help="The exact volume ID to delete.")
+        delete_group.add_argument('--volume-id', nargs='+', help="One or more exact volume IDs to delete.")
         delete_parser.add_argument('numbers', nargs='*', type=int, help="(Optional) Specific numbers to append to the pattern.")
 
         vpc_parser = subparsers.add_parser('vpc', help='VPC related commands.')
@@ -880,6 +891,8 @@ class Main:
                 display.display(f"No unattached disks found for this owner in region {manager.region}.", level='INFO')
             else:
                 Display.format_output_table(disks)
+                volume_ids = [disk['ID'] for disk in disks]
+                display.raw(" ".join(volume_ids))
 
     def do_vpc(self, manager, display, args):
         display.display(f"Entering do_vpc for command: {args.vpc_command}", level='DEBUG')
