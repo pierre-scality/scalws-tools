@@ -134,6 +134,7 @@ Creates and configures a specified number of EC2 instances. It checks for existi
 ##### `show`
 
 Displays information about existing lab resources. By default, it shows instances and their status, including hostname and timezone information retrieved via SSH.
+Without argument it will show machines created via this tool (owned by same owner)
 
 *   **Usage:** `./labws.py show [-x <prefix>] [-p <pattern>] [-e]`
 *   **Arguments:**
