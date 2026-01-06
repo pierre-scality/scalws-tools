@@ -710,42 +710,46 @@ class AWSManager:
             self.display.display(f"An AWS error occurred while listing shared AMIs: {e}", level='ERROR')
             return []
 
-    def create_launch_template(self, template_name, ami_id, instance_type, key_name, sg_ids, subnet_id):
+    def create_launch_template(self, template_name, ami_id, instance_type, key_name, sg_ids, subnet_id, devtype='lofs'):
         """Creates a new EC2 Launch Template."""
         try:
-            self.display.display(f"Creating launch template '{template_name}'...", level='INFO')
+            self.display.display(f"Creating launch template '{template_name}' with devtype '{devtype}'...", level='INFO')
+
+            # Determine root volume size based on devtype
+            root_volume_size = 100 if devtype == 'lofs' else self.config.get('root_volume_size', 50)
 
             # Define Block Device Mappings, including additional volumes
             block_device_mappings = [
                 {
                     'DeviceName': self.config.get('root_device_name', '/dev/sda1'),
                     'Ebs': {
-                        'VolumeSize': self.config.get('root_volume_size', 50),
+                        'VolumeSize': root_volume_size,
                     },
                 },
             ]
 
-            disk_configs = [
-                {'count': 2, 'size': 120, 'type': 'gp3'},
-                {'count': 12, 'size': 8, 'type': 'standard'}
-            ]
+            if devtype == 'device':
+                disk_configs = [
+                    {'count': 2, 'size': 120, 'type': 'gp3'},
+                    {'count': 12, 'size': 8, 'type': 'standard'}
+                ]
 
-            import string
-            device_letters = string.ascii_lowercase
-            # Start from 'b' since 'a' is the root device
-            device_index = 1 
+                import string
+                device_letters = string.ascii_lowercase
+                # Start from 'b' since 'a' is the root device
+                device_index = 1 
 
-            for config in disk_configs:
-                for i in range(config['count']):
-                    device_name = f'/dev/sd{device_letters[device_index]}'
-                    block_device_mappings.append({
-                        'DeviceName': device_name,
-                        'Ebs': {
-                            'VolumeSize': config['size'],
-                            'VolumeType': config['type'],
-                        }
-                    })
-                    device_index += 1
+                for config in disk_configs:
+                    for i in range(config['count']):
+                        device_name = f'/dev/sd{device_letters[device_index]}'
+                        block_device_mappings.append({
+                            'DeviceName': device_name,
+                            'Ebs': {
+                                'VolumeSize': config['size'],
+                                'VolumeType': config['type'],
+                            }
+                        })
+                        device_index += 1
 
             launch_template_data = {
                 'ImageId': ami_id,
@@ -1150,6 +1154,7 @@ class Main:
         create_template_parser = template_subparsers.add_parser('create', help='Create a new launch template from specifications.')
         create_template_parser.add_argument('--template-name', help='Name for the new template. Defaults to artelab-template-<YYYY-MM-DD>.')
         create_template_parser.add_argument('--ami-name', required=True, help="[Required] The name of the AMI.")
+        create_template_parser.add_argument('--devtype', default='lofs', choices=['device', 'lofs'], help="Disk configuration type: 'lofs' (100GB gp3) or 'device' (standard set). Default is 'lofs'.")
         create_template_parser.add_argument('--instance-type', help="The instance type.")
         create_template_parser.add_argument('--key-name', help="The key pair name.")
         create_template_parser.add_argument('--security-group-names', nargs='+', help="Security group names.")
@@ -1470,7 +1475,8 @@ class Main:
                     instance_type=args.instance_type or config['instance_type'],
                     key_name=args.key_name or config['key_name'],
                     sg_ids=sg_ids,
-                    subnet_id=subnet_id
+                    subnet_id=subnet_id,
+                    devtype=args.devtype
                 )
 
             elif args.template_command == 'delete':
