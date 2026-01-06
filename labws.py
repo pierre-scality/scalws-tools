@@ -3,6 +3,7 @@ import argparse
 import sys
 import os
 import boto3
+from datetime import datetime
 try:
     import paramiko
 except ImportError:
@@ -22,7 +23,111 @@ DEFAULT_SUBNET_NAME = 'scality-technical services-vpc-public-ap-northeast-1a' # 
 DEFAULT_VPC_NAME = 'scality-technical services-vpc' # Default VPC name for custom builds
 DEFAULT_ROOT_VOLUME_SIZE = 50 # GB
 DEFAULT_ROOT_DEVICE_NAME = '/dev/sda1' # Common for Linux AMIs, may need changing (e.g., to /dev/xvda)
+DEFAULT_LIFECYCLE_AUTOSTOP = 'nightly_ap_tokyo' # New constant for autostop tag
 
+
+class EnvManager:
+    """Manages loading and saving of environment configuration from a file."""
+    def __init__(self, display, defaults):
+        self.display = display
+        self.config_file = os.path.expanduser('~/.labws.conf')
+        self.defaults = defaults
+        self.config = self._load_config()
+
+    def _load_config(self):
+        """Loads configuration, merging defaults with the config file."""
+        merged_config = self.defaults.copy()
+        if not os.path.exists(self.config_file):
+            self.display.display(f"Config file '{self.config_file}' not found. Using default values.", level='DEBUG')
+            return merged_config
+
+        try:
+            with open(self.config_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    
+                    if '=' in line:
+                        key, value = line.split('=', 1)
+                        key = key.strip()
+                        value = value.strip().strip("'\"") # Handle quotes
+                        
+                        if key in merged_config:
+                            # Convert to the same type as the default value
+                            default_type = type(self.defaults[key])
+                            try:
+                                if default_type == bool:
+                                    merged_config[key] = value.lower() in ['true', '1', 'yes']
+                                elif default_type == int:
+                                    merged_config[key] = int(value)
+                                elif default_type == list:
+                                    # Simple list parsing, assumes comma-separated values
+                                    merged_config[key] = [item.strip() for item in value.split(',')]
+                                else:
+                                    merged_config[key] = default_type(value)
+                                self.display.display(f"Loaded '{key}' from config file.", level='DEBUG')
+                            except ValueError:
+                                self.display.display(f"Warning: Could not convert value '{value}' for key '{key}'. Using default.", level='ERROR')
+                        else:
+                            self.display.display(f"Ignoring unknown key '{key}' from config file.", level='DEBUG')
+        except Exception as e:
+            self.display.display(f"Error loading config file '{self.config_file}': {e}. Using default values.", level='ERROR')
+            return self.defaults
+
+        return merged_config
+
+    def get_config(self):
+        """Returns the merged configuration."""
+        return self.config
+
+    def show(self):
+        """Displays the current configuration."""
+        self.display.display("Current effective configuration (defaults + ~/.labws.conf):", level='INFO')
+        
+        # Determine max key length for alignment
+        max_key_len = max(len(key) for key in self.config.keys())
+        
+        for key, value in sorted(self.config.items()):
+            source = "default"
+            # A bit of a hacky way to check the source, but it works for this simple case
+            if os.path.exists(self.config_file):
+                with open(self.config_file, 'r') as f:
+                    for line in f:
+                        if line.strip().startswith(key):
+                            source = "user"
+                            break
+            self.display.raw(f"  {key:<{max_key_len}} = {value}  ({source})")
+
+    def create(self):
+        """Creates the config file with default values."""
+        if os.path.exists(self.config_file):
+            self.display.display(f"WARNING: Configuration file '{self.config_file}' already exists.", level='ERROR')
+            try:
+                confirm = self.display.query("Do you want to overwrite it? (y/n): ")
+            except KeyboardInterrupt:
+                self.display.display("\nOperation cancelled by user.", level='INFO')
+                sys.exit(1)
+
+            if confirm.lower() != 'y':
+                self.display.display("Operation cancelled.", level='INFO')
+                return
+        
+        try:
+            with open(self.config_file, 'w') as f:
+                f.write("# Scality Artesca Lab Workshop - User Configuration File\n")
+                f.write(f"# File automatically generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                for key, value in self.defaults.items():
+                    # Format value based on its type
+                    if isinstance(value, str):
+                        f.write(f"{key} = '{value}'\n")
+                    elif isinstance(value, list):
+                        f.write(f"{key} = {','.join(value)}\n")
+                    else:
+                        f.write(f"{key} = {value}\n")
+            self.display.display(f"Successfully created configuration file: '{self.config_file}'", level='INFO')
+        except Exception as e:
+            self.display.display(f"Failed to create configuration file: {e}", level='ERROR')
 
 
 class Display:
@@ -72,10 +177,11 @@ class Display:
 class AWSManager:
     """Manages all interactions with the AWS API."""
 
-    def __init__(self, region, display, owner=None):
+    def __init__(self, region, display, owner=None, config=None):
         self.region = region
         self.owner = owner
         self.display = display
+        self.config = config or {}
         try:
             self.ec2 = boto3.client('ec2', region_name=self.region)
             self.ec2.describe_regions()
@@ -90,26 +196,20 @@ class AWSManager:
                 self.display.display(f"An AWS service error occurred: {e}", level='ERROR')
                 sys.exit(1)
 
-    def launch_instance_from_template(self, launch_template_name, instance_name):
+    def launch_instance_from_template(self, launch_template_name, instance_name, availability_zone=None):
         """Launches an EC2 instance from a specified launch template."""
         try:
             self.display.display(f"Launching instance '{instance_name}' from template '{launch_template_name}'...", level='INFO')
-            
-            block_device_mappings = [
-                {
-                    'DeviceName': DEFAULT_ROOT_DEVICE_NAME,
-                    'Ebs': {
-                        'VolumeSize': DEFAULT_ROOT_VOLUME_SIZE,
-                    },
-                },
-            ]
 
             run_instances_args = {
                 'LaunchTemplate': {'LaunchTemplateName': launch_template_name},
                 'MinCount': 1,
                 'MaxCount': 1,
-                'BlockDeviceMappings': block_device_mappings,
             }
+
+            # If an availability zone is specified, add it to the launch arguments.
+            if availability_zone:
+                run_instances_args['Placement'] = {'AvailabilityZone': availability_zone}
 
             response = self.ec2.run_instances(**run_instances_args)
             instance_id = response['Instances'][0]['InstanceId']
@@ -120,7 +220,6 @@ class AWSManager:
             self.display.display(f"Instance '{instance_name}' ({instance_id}) is now running.", level='INFO')
 
             self._tag_root_volume(instance_id, instance_name)
-            self._create_and_attach_additional_volumes(instance_id, instance_name)
 
             self.ec2.create_tags(
                 Resources=[instance_id],
@@ -144,9 +243,9 @@ class AWSManager:
             
             block_device_mappings = [
                 {
-                    'DeviceName': DEFAULT_ROOT_DEVICE_NAME,
+                    'DeviceName': self.config.get('root_device_name', '/dev/sda1'),
                     'Ebs': {
-                        'VolumeSize': DEFAULT_ROOT_VOLUME_SIZE,
+                        'VolumeSize': self.config.get('root_volume_size', 50),
                     },
                 },
             ]
@@ -407,7 +506,7 @@ class AWSManager:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-        passwords_to_try = [DEFAULT_NEW_PASSWORD, 'scality']
+        passwords_to_try = [self.config.get('new_password', '150.249.201.205ONssh:notty'), 'scality']
         
         for password in passwords_to_try:
             try:
@@ -576,10 +675,10 @@ class AWSManager:
             self.display.display(f"An AWS error occurred while searching for AMI '{name}': {e}", level='ERROR')
             return None
 
-    def list_shared_artesca_amis(self):
+    def list_shared_artesca_amis(self, show_all=False):
         """Lists AMIs shared with the current account that have names starting with 'artesca-'."""
         try:
-            self.display.display("Listing AMIs shared with this account, named 'artesca-*'...", level='INFO')
+            self.display.display("Listing AMIs shared with this account, named 'artesca-*' ટુ...", level='INFO')
             response = self.ec2.describe_images(
                 Filters=[
                     {'Name': 'name', 'Values': ['artesca-*']},
@@ -590,8 +689,14 @@ class AWSManager:
 
             shared_amis = []
             for image in response['Images']:
+                ami_name = image.get('Name', 'N/A')
+                
+                if not show_all:
+                    if ami_name.endswith('-dev') or '-preview' in ami_name or '-rc' in ami_name:
+                        continue
+
                 shared_amis.append({
-                    'Name': image.get('Name', 'N/A'),
+                    'Name': ami_name,
                     'ImageId': image.get('ImageId', 'N/A'),
                     'OwnerId': image.get('OwnerId', 'N/A'),
                     'CreationDate': image.get('CreationDate', 'N/A')
@@ -605,6 +710,308 @@ class AWSManager:
             self.display.display(f"An AWS error occurred while listing shared AMIs: {e}", level='ERROR')
             return []
 
+    def create_launch_template(self, template_name, ami_id, instance_type, key_name, sg_ids, subnet_id):
+        """Creates a new EC2 Launch Template."""
+        try:
+            self.display.display(f"Creating launch template '{template_name}'...", level='INFO')
+
+            # Define Block Device Mappings, including additional volumes
+            block_device_mappings = [
+                {
+                    'DeviceName': self.config.get('root_device_name', '/dev/sda1'),
+                    'Ebs': {
+                        'VolumeSize': self.config.get('root_volume_size', 50),
+                    },
+                },
+            ]
+
+            disk_configs = [
+                {'count': 2, 'size': 120, 'type': 'gp3'},
+                {'count': 12, 'size': 8, 'type': 'standard'}
+            ]
+
+            import string
+            device_letters = string.ascii_lowercase
+            # Start from 'b' since 'a' is the root device
+            device_index = 1 
+
+            for config in disk_configs:
+                for i in range(config['count']):
+                    device_name = f'/dev/sd{device_letters[device_index]}'
+                    block_device_mappings.append({
+                        'DeviceName': device_name,
+                        'Ebs': {
+                            'VolumeSize': config['size'],
+                            'VolumeType': config['type'],
+                        }
+                    })
+                    device_index += 1
+
+            launch_template_data = {
+                'ImageId': ami_id,
+                'InstanceType': instance_type,
+                'BlockDeviceMappings': block_device_mappings,
+                'NetworkInterfaces': [
+                    {
+                        'DeviceIndex': 0,
+                        'SubnetId': subnet_id,
+                        'Groups': sg_ids,
+                    }
+                ],
+                'TagSpecifications': [
+                    {
+                        'ResourceType': 'instance',
+                        'Tags': [
+                            {'Key': 'Name', 'Value': template_name},
+                            {'Key': 'owner', 'Value': self.owner},
+                            {'Key': 'artesca_lab', 'Value': 'yes'},
+                            {'Key': 'lifecycle_autostop', 'Value': self.config.get('lifecycle_autostop', 'nightly_ap_tokyo')},
+                            {'Key': 'lifecycle_autostart', 'Value': 'no'}
+                        ]
+                    }
+                ]
+            }
+
+            if key_name:
+                launch_template_data['KeyName'] = key_name
+
+            response = self.ec2.create_launch_template(
+                LaunchTemplateName=template_name,
+                LaunchTemplateData=launch_template_data,
+                TagSpecifications=[
+                    {
+                        'ResourceType': 'launch-template',
+                        'Tags': [
+                            {'Key': 'owner', 'Value': self.owner},
+                            {'Key': 'artelab-template', 'Value': 'yes'}
+                        ]
+                    }
+                ]
+            )
+            
+            template = response['LaunchTemplate']
+            self.display.display(f"Successfully created launch template '{template['LaunchTemplateName']}' (ID: {template['LaunchTemplateId']}).", level='INFO')
+            return template
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'InvalidLaunchTemplateName.AlreadyExistsException':
+                self.display.display(f"Error: A launch template with the name '{template_name}' already exists.", level='ERROR')
+            else:
+                self.display.display(f"An AWS error occurred while creating the launch template: {e}", level='ERROR')
+            return None
+
+    def list_launch_templates(self):
+        """Lists launch templates owned by the user, sorted by creation date."""
+        try:
+            self.display.display(f"Listing launch templates created by '{self.owner}'...", level='INFO')
+            paginator = self.ec2.get_paginator('describe_launch_templates')
+            pages = paginator.paginate()
+
+            owned_templates_raw = []
+            for page in pages:
+                for template in page['LaunchTemplates']:
+                    created_by_arn = template.get('CreatedBy', '')
+                    # Extract owner email (e.g., from 'arn:aws:iam::ACCOUNT:user/EMAIL')
+                    owner_email = created_by_arn.split('/')[-1]
+                    if owner_email == self.owner:
+                        owned_templates_raw.append(template)
+
+            # Sort templates by creation time, newest first
+            owned_templates_raw.sort(key=lambda t: t['CreateTime'], reverse=True)
+
+            templates = []
+            for template in owned_templates_raw:
+                created_by_arn = template.get('CreatedBy', 'N/A')
+                if '/' in created_by_arn:
+                    owner_display = created_by_arn.split('/')[-1]
+                else:
+                    owner_display = created_by_arn
+
+                templates.append({
+                    'Name': template['LaunchTemplateName'],
+                    'Owner': owner_display,
+                    'Created': template['CreateTime'].strftime('%Y-%m-%d %H:%M:%S'),
+                })
+            return templates
+        except ClientError as e:
+            self.display.display(f"An AWS error occurred while listing launch templates: {e}", level='ERROR')
+            return []
+
+    def delete_launch_template(self, template_name):
+        """Deletes a specified launch template."""
+        try:
+            self.display.display(f"Deleting launch template '{template_name}'...", level='INFO')
+            self.ec2.delete_launch_template(LaunchTemplateName=template_name)
+            self.display.display(f"Successfully deleted launch template '{template_name}'.", level='INFO')
+            return True
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'InvalidLaunchTemplateName.NotFoundException':
+                self.display.display(f"Error: Launch template '{template_name}' not found.", level='ERROR')
+            else:
+                self.display.display(f"An AWS error occurred while deleting the launch template: {e}", level='ERROR')
+            return False
+
+    def get_launch_template(self, template_name):
+        """Retrieves and displays the details of a specific launch template."""
+        try:
+            self.display.display(f"Showing details for launch template '{template_name}'...", level='INFO')
+            response = self.ec2.describe_launch_templates(LaunchTemplateNames=[template_name])
+            
+            if not response['LaunchTemplates']:
+                self.display.display(f"Launch template '{template_name}' not found.", level='ERROR')
+                return None
+            
+            template = response['LaunchTemplates'][0]
+            
+            # Get the latest version data
+            versions_response = self.ec2.describe_launch_template_versions(
+                LaunchTemplateName=template_name,
+                Versions=['$Latest']
+            )
+            template_data = versions_response['LaunchTemplateVersions'][0]['LaunchTemplateData']
+
+            details = {
+                'Name': template['LaunchTemplateName'],
+                'Id': template['LaunchTemplateId'],
+                'CreatedBy': template.get('CreatedBy'),
+                'CreateTime': template['CreateTime'].strftime('%Y-%m-%d %H:%M:%S'),
+                'DefaultVersion': template['DefaultVersionNumber'],
+                'LatestVersion': template['LatestVersionNumber'],
+                'Tags': template.get('Tags', 'No Tags Found')
+            }
+            
+            self.display.raw("\n--- Template Details ---")
+            for key, value in details.items():
+                self.display.raw(f"{key}: {value}")
+
+            self.display.raw("\n--- Launch Data (Latest Version) ---")
+            for key, value in template_data.items():
+                if key == 'TagSpecifications':
+                    self.display.raw("TagSpecifications:")
+                    for spec in value:
+                        self.display.raw(f"  - ResourceType: {spec['ResourceType']}")
+                        self.display.raw(f"    Tags: {spec['Tags']}")
+                elif key == 'BlockDeviceMappings':
+                    self.display.raw("BlockDeviceMappings:")
+                    for bdm in value:
+                        self.display.raw(f"  - DeviceName: {bdm['DeviceName']}")
+                        self.display.raw(f"    Ebs: {bdm['Ebs']}")
+                else:
+                    self.display.raw(f"{key}: {value}")
+            
+            return template
+
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'InvalidLaunchTemplateName.NotFoundException':
+                self.display.display(f"Error: Launch template '{template_name}' not found.", level='ERROR')
+            else:
+                self.display.display(f"An AWS error occurred while describing the launch template: {e}", level='ERROR')
+            return None
+
+    def get_resources_to_destroy(self, prefix, pattern):
+        """Finds all resources (instances, EIPs, volumes) associated with a prefix and pattern."""
+        resources = {'instances': [], 'eips': [], 'volumes': []}
+        
+        # 1. Find instances
+        instances = self.list_instances_by_prefix_and_pattern(prefix, pattern)
+        if not instances:
+            return resources
+        
+        resources['instances'] = instances
+        instance_ids = [i['InstanceId'] for i in instances]
+
+        # 2. Find all volumes attached to these instances
+        try:
+            self.display.display(f"Describing instances {instance_ids} to find attached volumes...", level='VERBOSE')
+            response = self.ec2.describe_instances(InstanceIds=instance_ids)
+            
+            volume_ids = []
+            for reservation in response['Reservations']:
+                for instance in reservation['Instances']:
+                    for bdm in instance.get('BlockDeviceMappings', []):
+                        if 'Ebs' in bdm and 'VolumeId' in bdm['Ebs']:
+                            volume_ids.append(bdm['Ebs']['VolumeId'])
+            
+            if volume_ids:
+                self.display.display(f"Found {len(volume_ids)} attached volumes. Describing them...", level='VERBOSE')
+                vol_response = self.ec2.describe_volumes(VolumeIds=volume_ids)
+                for vol in vol_response['Volumes']:
+                    volume_name = next((tag['Value'] for tag in vol.get('Tags', []) if tag['Key'] == 'Name'), 'N/A')
+                    resources['volumes'].append({
+                        'VolumeId': vol['VolumeId'],
+                        'Name': volume_name,
+                        'Size': vol['Size']
+                    })
+
+        except ClientError as e:
+            self.display.display(f"An AWS error occurred while finding volumes: {e}", level='ERROR')
+
+        # 3. Find associated EIPs
+        try:
+            self.display.display("Searching for associated EIPs...", level='VERBOSE')
+            addresses = self.ec2.describe_addresses()['Addresses']
+            
+            for addr in addresses:
+                if addr.get('InstanceId') in instance_ids:
+                    eip_name = next((tag['Value'] for tag in addr.get('Tags', []) if tag['Key'] == 'Name'), 'N/A')
+                    resources['eips'].append({
+                        'PublicIp': addr['PublicIp'],
+                        'AllocationId': addr['AllocationId'],
+                        'Name': eip_name
+                    })
+        except ClientError as e:
+            self.display.display(f"An AWS error occurred while searching for EIPs: {e}", level='ERROR')
+            
+        return resources
+
+    def destroy_lab_resources(self, resources):
+        """Terminates instances, releases EIPs, and deletes volumes."""
+        instance_ids = [i['InstanceId'] for i in resources.get('instances', [])]
+        eips = resources.get('eips', [])
+        volume_ids = [v['VolumeId'] for v in resources.get('volumes', [])]
+
+        # 1. Terminate Instances
+        if instance_ids:
+            try:
+                self.display.display(f"Terminating {len(instance_ids)} instance(s): {', '.join(instance_ids)}", level='INFO')
+                self.ec2.terminate_instances(InstanceIds=instance_ids)
+                
+                waiter = self.ec2.get_waiter('instance_terminated')
+                waiter.wait(InstanceIds=instance_ids)
+                self.display.display("All specified instances have been successfully terminated.", level='INFO')
+            except ClientError as e:
+                self.display.display(f"An AWS error occurred during instance termination: {e}", level='ERROR')
+                self.display.display("Please check the AWS console. Some resources may not have been deleted.", level='ERROR')
+                return
+
+        # 2. Release EIPs
+        # This can be done in parallel with instance termination.
+        if eips:
+            for eip in eips:
+                try:
+                    self.display.display(f"Releasing EIP {eip['PublicIp']}...", level='INFO')
+                    self.ec2.release_address(AllocationId=eip['AllocationId'])
+                except ClientError as e:
+                    self.display.display(f"Could not release EIP {eip['PublicIp']} (AllocationId: {eip['AllocationId']}). It may have already been released or an error occurred: {e}", level='ERROR')
+
+        # 3. Delete Volumes
+        # This should happen after instances are confirmed terminated.
+        if volume_ids:
+            self.display.display(f"Starting deletion of {len(volume_ids)} volume(s)...", level='INFO')
+            for volume_id in volume_ids:
+                try:
+                    self.display.display(f"Deleting volume {volume_id}...", level='VERBOSE')
+                    self.ec2.delete_volume(VolumeId=volume_id)
+                except ClientError as e:
+                    # It's possible for volumes to be deleted automatically with instance termination
+                    # if the 'DeleteOnTermination' flag was set. We can treat 'NotFound' as a success.
+                    if e.response['Error']['Code'] == 'InvalidVolume.NotFound':
+                        self.display.display(f"Volume {volume_id} was not found. It may have been deleted already.", level='VERBOSE')
+                    else:
+                        self.display.display(f"An AWS error occurred while deleting volume {volume_id}: {e}", level='ERROR')
+            
+            self.display.display("All specified volumes have been processed for deletion.", level='INFO')
+
+
 class TemplateManager:
     """Manages launching instances from templates."""
 
@@ -612,7 +1019,7 @@ class TemplateManager:
         self.aws_manager = aws_manager
         self.display = display
 
-    def launch_instances(self, count, prefix, pattern, launch_template_name):
+    def launch_instances(self, count, prefix, pattern, launch_template_name, availability_zone=None):
         """Launches a number of instances, names them, and assigns EIPs, checking for existing ones."""
         if count <= 0:
             self.display.display("Error: Number of machines to start must be greater than 0.", level='ERROR')
@@ -644,8 +1051,8 @@ class TemplateManager:
             self.display.display("All requested instances already exist. Nothing to do.", level='INFO')
             return
 
-        self.display.display("The following new resources will be created:", level='INFO')
-        Display.format_output_table(instances_to_actually_create)
+        machine_names = ', '.join([instance['Name'] for instance in instances_to_actually_create])
+        self.display.display(f"The following machines will be created: {machine_names}", level='INFO')
 
         try:
             confirm = self.display.query("Do you want to proceed with creation? (y/n): ")
@@ -663,7 +1070,7 @@ class TemplateManager:
             instance_name = instance_to_create['Name']
             self.display.display(f"--- Processing instance: {instance_name} ---", level='INFO')
             
-            instance_id = self.aws_manager.launch_instance_from_template(launch_template_name, instance_name)
+            instance_id = self.aws_manager.launch_instance_from_template(launch_template_name, instance_name, availability_zone)
             if not instance_id:
                 self.display.display(f"Failed to launch instance '{instance_name}'. Aborting.", level='ERROR')
                 break
@@ -679,8 +1086,8 @@ class Main:
         self.parser = self._create_parser()
 
     def _create_parser(self):
-        parser = argparse.ArgumentParser(description="Script to manage lab environments on AWS.")
-        parser.add_argument('-r', '--region', help=f"AWS region to use (default: {DEFAULT_REGION}).")
+        parser = argparse.ArgumentParser(description="Script to manage lab environments on AWS using template.\nSee individual section help for details")
+        parser.add_argument('-r', '--region', help="AWS region to use.")
         parser.add_argument('-v', '--verbose', action='store_true', help="Enable verbose output.")
         parser.add_argument('-d', '--debug', action='store_true', help="Enable debug output.")
         parser.add_argument('-o', '--owner', help="Email of the owner to filter by.")
@@ -688,13 +1095,28 @@ class Main:
         
         subparsers = parser.add_subparsers(dest='command', help='Sub-command help')
 
-        # Build subcommand
-        descript="To build lab use build opption with -c for number of machine and then prefix and pattern.\nThe machines will be named <prefix>-<pattern>-<count>. prefix is build from user email by default"
-        destript=descript+"\n configure will do basic system config like change hostname and add EIP"
-        build_parser = subparsers.add_parser('build', help="Build machines.")
-        build_parser.add_argument('-c', '--count', type=int, required=True, help="The number of machines to start.")
-        build_parser.add_argument('-x', '--prefix', help="The prefix for the machine name. If not provided, it will be generated from the owner's email.")
-        build_parser.add_argument('-p', '--pattern', default='vm', help="The pattern for the machine name (e.g., 'server'). Default is 'vm'.")
+        # --- Build subcommand ---
+        build_parser = subparsers.add_parser('build', help="Build machines from a template or from scratch.")
+        
+        # Create titled groups for better help output
+        generic_group = build_parser.add_argument_group('Generic Options')
+        template_group = build_parser.add_argument_group('Method 1: Build from Template')
+        scratch_group = build_parser.add_argument_group('Method 2: Build from Scratch')
+
+        # Add arguments to their respective groups
+        generic_group.add_argument('-c', '--count', type=int, default=1, help="The number of machines to start. Defaults to 1.")
+        generic_group.add_argument('-x', '--prefix', help="The prefix for machine names. If not provided, it will be\ngenerated from the owner's email.")
+        generic_group.add_argument('-p', '--pattern', default='vm', help="The pattern for machine names (e.g., 'server').\nDefault is 'vm'.")
+
+        template_group.add_argument('-t', '--template', nargs='?', const=True, default=None,
+                                help="Use this method to build from a template. If a template\nname is provided, it's used. If the flag is used without a\nname, the default from config is used.")
+
+        scratch_group.add_argument('--ami-name', help="The name of the AMI. Required for 'from-scratch' build.")
+        scratch_group.add_argument('--instance-type', help="The instance type.")
+        scratch_group.add_argument('--key-name', help="The key pair name.")
+        scratch_group.add_argument('--security-group-names', nargs='+', help="Security group names.")
+        scratch_group.add_argument('--subnet-name', help="The subnet name.")
+        scratch_group.add_argument('--vpc-name', help="The VPC name.")
 
         # Show subcommand
         show_parser = subparsers.add_parser('show', help='Show resources.')
@@ -707,13 +1129,40 @@ class Main:
         configure_parser.add_argument('-x', '--prefix', help="The prefix for the machine name. If not provided, it will be generated from the owner's email.")
         configure_parser.add_argument('-p', '--pattern', default='vm', help="The pattern for the machine name (e.g., 'server'). Default is 'vm'.")
 
-        # Test subcommand for custom builds
-        test_parser = subparsers.add_parser('test', help='Build a custom machine by specifying resources (for testing).')
-        test_parser.add_argument('--name', required=True, help="The name for the new instance.")
-        test_parser.add_argument('--ami-name', required=True, help="The name of the AMI (e.g., 'RHEL-9.3.0_HVM-20240416-x86_64-65-Access2-GP2').")
+        # Destroy subcommand
+        destroy_parser = subparsers.add_parser('destroy', help='Destroy machines and associated resources.')
+        destroy_parser.add_argument('-x', '--prefix', help="The prefix for the machine name. If not provided, it will be generated from the owner's email.")
+        destroy_parser.add_argument('-p', '--pattern', default='vm', help="The pattern for the machine name (e.g., 'server'). Default is 'vm'.")
+
+        # Env subcommand
+        env_parser = subparsers.add_parser('env', help='Manage local environment configuration (~/.labws.conf).')
+        env_parser.add_argument('action', nargs='?', default='show', choices=['show', 'create'], help="Action to perform: 'show' (default) or 'create'.")
 
         # AMI subcommand
         ami_parser = subparsers.add_parser('ami', help='List AMIs shared with me, filtered by name.')
+        ami_parser.add_argument('--all', action='store_true', help='Show all AMIs, including preview, rc, and dev versions.')
+
+        # Template subcommand
+        template_parser = subparsers.add_parser('template', help='Manage launch templates.')
+        template_subparsers = template_parser.add_subparsers(dest='template_command', help='Template commands')
+
+        # template create
+        create_template_parser = template_subparsers.add_parser('create', help='Create a new launch template from specifications.')
+        create_template_parser.add_argument('--template-name', help='Name for the new template. Defaults to artelab-template-<YYYY-MM-DD>.')
+        create_template_parser.add_argument('--ami-name', required=True, help="[Required] The name of the AMI.")
+        create_template_parser.add_argument('--instance-type', help="The instance type.")
+        create_template_parser.add_argument('--key-name', help="The key pair name.")
+        create_template_parser.add_argument('--security-group-names', nargs='+', help="Security group names.")
+        create_template_parser.add_argument('--subnet-name', help="The subnet name.")
+        create_template_parser.add_argument('--vpc-name', help="The VPC name.")
+
+        # template delete
+        delete_template_parser = template_subparsers.add_parser('delete', help='Delete a launch template.')
+        delete_template_parser.add_argument('--template-name', required=True, help='[Required] Name of the template to delete.')
+
+        # template show
+        show_template_parser = template_subparsers.add_parser('show', help='Show details of a launch template.')
+        show_template_parser.add_argument('--template-name', required=True, help='[Required] Name of the template to show.')
 
         return parser
 
@@ -731,7 +1180,9 @@ class Main:
 
     def run(self):
         args = self.parser.parse_args()
-        
+        if args.command == None:
+          self.parser.print_help()
+          sys.exit(1)
         level = 'INFO'
         if args.verbose:
             level = 'VERBOSE'
@@ -739,6 +1190,33 @@ class Main:
             level = 'DEBUG'
 
         display = Display(level=level)
+
+        # --- Configuration Management ---
+        defaults = {
+            'region': DEFAULT_REGION,
+            'owner': DEFAULT_OWNER,
+            'launch_template': DEFAULT_LAUNCH_TEMPLATE,
+            'new_password': DEFAULT_NEW_PASSWORD,
+            'timezone': DEFAULT_TIMEZONE,
+            'instance_type': DEFAULT_INSTANCE_TYPE,
+            'key_name': DEFAULT_KEY_NAME,
+            'security_group_names': DEFAULT_SECURITY_GROUP_NAMES,
+            'subnet_name': DEFAULT_SUBNET_NAME,
+            'vpc_name': DEFAULT_VPC_NAME,
+            'root_volume_size': DEFAULT_ROOT_VOLUME_SIZE,
+            'root_device_name': DEFAULT_ROOT_DEVICE_NAME,
+            'lifecycle_autostop': DEFAULT_LIFECYCLE_AUTOSTOP
+        }
+        env_manager = EnvManager(display, defaults)
+        config = env_manager.get_config()
+
+        # Handle 'env' command first, as it doesn't need full AWS manager setup
+        if args.command == 'env':
+            if args.action == 'show':
+                env_manager.show()
+            elif args.action == 'create':
+                env_manager.create()
+            sys.exit(0)
 
         # Enable paramiko logging if verbose or debug is on
         if level in ['VERBOSE', 'DEBUG']:
@@ -757,18 +1235,92 @@ class Main:
             
             display.display("Paramiko logging enabled.", level='DEBUG')
 
-        aws_region = args.region or DEFAULT_REGION
-        owner = args.owner or DEFAULT_OWNER
-        launch_template = DEFAULT_LAUNCH_TEMPLATE
+        aws_region = args.region or config['region']
+        owner = args.owner or config['owner']
         availability_zone = args.availability_zone
 
-        manager = AWSManager(region=aws_region, display=display, owner=owner)
+
+        manager = AWSManager(region=aws_region, display=display, owner=owner, config=config)
 
         if args.command == 'build':
             prefix = args.prefix or self._generate_prefix_from_owner(owner)
-            pattern = args.pattern
-            template_manager = TemplateManager(aws_manager=manager, display=display)
-            template_manager.launch_instances(args.count, prefix, pattern, launch_template)
+
+            if args.template and args.ami_name:
+                display.display("Error: --template and --ami-name cannot be used together. Please choose one build method.", level='ERROR')
+                sys.exit(1)
+            
+            # --- Template-based build path ---
+            if args.template:
+                # If --template is used without a value, args.template will be True. Use the config default.
+                template_name = args.template if isinstance(args.template, str) else config['launch_template']
+                display.display(f"Starting template-based build using template: '{template_name}'", level='INFO')
+                template_manager = TemplateManager(aws_manager=manager, display=display)
+                template_manager.launch_instances(args.count, prefix, args.pattern, template_name, availability_zone=availability_zone)
+            
+            # --- From-scratch build path ---
+            else:
+                display.display("Starting from-scratch build...", level='INFO')
+                if not args.ami_name:
+                    display.display("Error: --ami-name is required for a from-scratch build.", level='ERROR')
+                    sys.exit(1)
+
+                # 1. Resolve all resource names to AWS IDs once before the loop
+                display.display("Resolving specified resource names to AWS IDs...", level='INFO')
+                vpc_name = args.vpc_name or config['vpc_name']
+                subnet_name = args.subnet_name or config['subnet_name']
+                sg_names = args.security_group_names or config['security_group_names']
+
+                vpc_id = manager.get_vpc_id_by_name(vpc_name)
+                if not vpc_id:
+                    display.display(f"Could not resolve VPC '{vpc_name}'. Aborting.", level='ERROR')
+                    sys.exit(1)
+
+                ami_id = manager.get_ami_id_by_name(args.ami_name)
+                subnet_id = manager.get_subnet_id_by_name(subnet_name, vpc_id=vpc_id)
+                sg_ids = manager.get_sg_ids_by_names(sg_names, vpc_id=vpc_id)
+
+                if not all([ami_id, subnet_id, sg_ids]):
+                    display.display("Could not resolve all required resources from names. Please check the arguments and the region. Aborting.", level='ERROR')
+                    sys.exit(1)
+
+                # 2. Confirm with the user before creating multiple instances
+                instance_type = args.instance_type or config['instance_type']
+                key_name = args.key_name or config['key_name']
+                
+                machine_names = ', '.join([f"{prefix}-{args.pattern}-{i:02d}" for i in range(1, args.count + 1)])
+                display.display(f"The following machines will be created: {machine_names}", level='INFO')
+                display.display(f"Using AMI '{args.ami_name}', instance type '{instance_type}', key '{key_name or 'N/A'}', subnet '{subnet_name}', and security groups '{', '.join(sg_names)}'.", level='INFO')
+
+                try:
+                    confirm = display.query("Do you want to proceed with creation? (y/n): ")
+                except KeyboardInterrupt:
+                    display.display("\nOperation cancelled by user.", level='INFO')
+                    sys.exit(1)
+                
+                if confirm.lower() != 'y':
+                    display.display("Operation cancelled by user.", level='INFO')
+                    sys.exit(0)
+
+                # 3. Loop to create each instance
+                for i in range(1, args.count + 1):
+                    instance_name = f"{prefix}-{args.pattern}-{i:02d}"
+                    display.display(f"--- Processing instance: {instance_name} ---", level='INFO')
+
+                    instance_id = manager.launch_instance_from_spec(
+                        name=instance_name,
+                        ami_id=ami_id,
+                        instance_type=instance_type,
+                        key_name=key_name,
+                        sg_ids=sg_ids,
+                        subnet_id=subnet_id
+                    )
+                    if instance_id:
+                        public_ip = manager.create_and_assign_eip(instance_id, instance_name)
+                        if public_ip:
+                            display.display(f"Successfully launched instance '{instance_name}' and assigned Public IP '{public_ip}'.", level='INFO')
+                    else:
+                        display.display(f"Failed to launch instance '{instance_name}'. Aborting subsequent launches.", level='ERROR')
+                        break
         
         elif args.command == 'show':
             # If no prefix, pattern or eip flag is given, show all lab instances.
@@ -834,71 +1386,108 @@ class Main:
                     continue
                 
                 display.display(f"--- Configuring instance: {name} ({ip}) ---", level='INFO')
-                self._configure_instance(ip, name, display)
+                self._configure_instance(ip, name, display, config)
 
-        elif args.command == 'test':
-            instance_name = args.name
+        elif args.command == 'destroy':
+            prefix = args.prefix or self._generate_prefix_from_owner(owner)
+            pattern = args.pattern or 'vm'
             
-            # Resolve all resource names to IDs using default constants
-            display.display("Resolving specified resource names to AWS IDs using script defaults...", level='INFO')
+            display.display(f"Finding resources to destroy for prefix '{prefix}' and pattern '{pattern}'...", level='INFO')
+            resources_to_destroy = manager.get_resources_to_destroy(prefix, pattern)
             
-            vpc_id = manager.get_vpc_id_by_name(DEFAULT_VPC_NAME)
-            if not vpc_id:
-                display.display(f"Could not resolve VPC '{DEFAULT_VPC_NAME}'. Aborting.", level='ERROR')
-                sys.exit(1)
+            instances = resources_to_destroy.get('instances', [])
+            eips = resources_to_destroy.get('eips', [])
+            volumes = resources_to_destroy.get('volumes', [])
 
-            ami_id = manager.get_ami_id_by_name(args.ami_name)
-            subnet_id = manager.get_subnet_id_by_name(DEFAULT_SUBNET_NAME, vpc_id=vpc_id)
-            sg_ids = manager.get_sg_ids_by_names(DEFAULT_SECURITY_GROUP_NAMES, vpc_id=vpc_id)
+            if not instances and not eips and not volumes:
+                display.display("No resources found to destroy.", level='INFO')
+                sys.exit(0)
 
-            if not all([ami_id, subnet_id, sg_ids]):
-                display.display("Could not resolve all required resources from names. Please check the DEFAULT constants in the script and the region. Aborting.", level='ERROR')
-                sys.exit(1)
-
-            display.display("A new custom instance will be created with the following details:", level='INFO')
-            details_table = [{'Name': instance_name, 
-                              'AMI': args.ami_name, 
-                              'Type': DEFAULT_INSTANCE_TYPE, 
-                              'Key': DEFAULT_KEY_NAME or 'N/A', 
-                              'Subnet': f"{DEFAULT_SUBNET_NAME} ({subnet_id})", 
-                              'SGs': f"{', '.join(DEFAULT_SECURITY_GROUP_NAMES)} ({', '.join(sg_ids)})"}]
-            Display.format_output_table(details_table)
+            display.display("The following resources will be permanently deleted:", level='INFO')
+            if instances:
+                display.display("\n--- Instances to Terminate ---", level='INFO')
+                Display.format_output_table([{'ID': i['InstanceId'], 'Name': i['Name']} for i in instances])
+            if eips:
+                display.display("\n--- EIPs to Release ---", level='INFO')
+                Display.format_output_table([{'IP': eip['PublicIp'], 'Name': eip.get('Name', 'N/A')} for eip in eips])
+            if volumes:
+                display.display("\n--- Volumes to Delete ---", level='INFO')
+                Display.format_output_table([{'ID': vol['VolumeId'], 'Name': vol.get('Name', 'N/A'), 'Size (GB)': vol['Size']} for vol in volumes])
 
             try:
-                confirm = display.query("Do you want to proceed with creation? (y/n): ")
+                confirm = display.query("\nAre you sure you want to delete all these resources? This action cannot be undone. (y/n): ")
             except KeyboardInterrupt:
                 display.display("\nOperation cancelled by user.", level='INFO')
                 sys.exit(1)
-            
+                
             if confirm.lower() != 'y':
                 display.display("Operation cancelled by user.", level='INFO')
                 sys.exit(0)
-
-            instance_id = manager.launch_instance_from_spec(
-                name=instance_name,
-                ami_id=ami_id,
-                instance_type=DEFAULT_INSTANCE_TYPE,
-                key_name=DEFAULT_KEY_NAME,
-                sg_ids=sg_ids,
-                subnet_id=subnet_id
-            )
-            if instance_id:
-                public_ip = manager.create_and_assign_eip(instance_id, instance_name)
-                if public_ip:
-                    display.display(f"Successfully launched instance '{instance_name}' and assigned Public IP '{public_ip}'.", level='INFO')
+            
+            display.display("User confirmed. Proceeding with resource deletion...", level='INFO')
+            manager.destroy_lab_resources(resources_to_destroy)
 
         elif args.command == 'ami':
-            amis = manager.list_shared_artesca_amis()
+            amis = manager.list_shared_artesca_amis(show_all=args.all)
             if amis:
                 Display.format_output_table(amis)
             else:
                 display.display("No 'artesca-*' AMIs shared with this account were found.", level='INFO')
 
+        elif args.command == 'template':
+            if args.template_command is None: # Default to list if no subcommand is provided
+                templates = manager.list_launch_templates()
+                if templates:
+                    Display.format_output_table(templates)
+                else:
+                    display.display("No matching launch templates found.", level='INFO')
+            
+            elif args.template_command == 'create':
+                template_name = args.template_name or f"artelab-template-{datetime.now().strftime('%Y-%m-%d')}"
+                display.display(f"Preparing to create launch template '{template_name}'...", level='INFO')
+
+                # Resolve resource names to IDs
+                vpc_name = args.vpc_name or config['vpc_name']
+                subnet_name = args.subnet_name or config['subnet_name']
+                sg_names = args.security_group_names or config['security_group_names']
+
+                vpc_id = manager.get_vpc_id_by_name(vpc_name)
+                if not vpc_id:
+                    display.display(f"Could not resolve VPC '{vpc_name}'. Aborting.", level='ERROR')
+                    sys.exit(1)
+
+                ami_id = manager.get_ami_id_by_name(args.ami_name)
+                subnet_id = manager.get_subnet_id_by_name(subnet_name, vpc_id=vpc_id)
+                sg_ids = manager.get_sg_ids_by_names(sg_names, vpc_id=vpc_id)
+
+                if not all([ami_id, subnet_id, sg_ids]):
+                    display.display("Could not resolve all required resources from names. Please check the arguments and the region. Aborting.", level='ERROR')
+                    sys.exit(1)
+                
+                manager.create_launch_template(
+                    template_name=template_name,
+                    ami_id=ami_id,
+                    instance_type=args.instance_type or config['instance_type'],
+                    key_name=args.key_name or config['key_name'],
+                    sg_ids=sg_ids,
+                    subnet_id=subnet_id
+                )
+
+            elif args.template_command == 'delete':
+                manager.delete_launch_template(args.template_name)
+
+            elif args.template_command == 'show':
+                manager.get_launch_template(args.template_name)
+
+            else:
+                display.display("Please specify a valid command for 'template': create, delete, or show.", level='INFO')
+                sys.exit(1)
+
         else:
             self.parser.print_help()
             sys.exit(1)
 
-    def _configure_instance(self, ip_address, instance_name, display):
+    def _configure_instance(self, ip_address, instance_name, display, config):
         """Performs configuration (password, hostname, timezone) on a single instance."""
         if not paramiko:
             display.display("The 'paramiko' library is required for the 'configure' command.", level='ERROR')
@@ -924,6 +1513,8 @@ class Main:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         current_password = None
+        new_password = config.get('new_password', '150.249.201.205ONssh:notty')
+        timezone = config.get('timezone', 'Asia/Tokyo')
 
         try:
             display.display(f"Attempting to connect to {ip_address} with initial password 'scality'...", level='INFO')
@@ -944,24 +1535,24 @@ class Main:
                     client.close()
                     return
 
-                shell.send(f"{DEFAULT_NEW_PASSWORD}\n")
+                shell.send(f"{new_password}\n")
                 output, found = read_shell_until(shell, "Retype new password:")
                 if not found:
                     display.display("Did not receive 'Retype new password:' prompt. Aborting configuration for this instance.", level='ERROR')
                     client.close()
                     return
                     
-                shell.send(f"{DEFAULT_NEW_PASSWORD}\n")
+                shell.send(f"{new_password}\n")
                 time.sleep(1) # Give server time to process
                 
                 display.display("Password change sequence completed. Assuming password is now the new default.", level='INFO')
-                current_password = DEFAULT_NEW_PASSWORD
+                current_password = new_password
             
             client.close()
 
         except paramiko.AuthenticationException:
             display.display("Authentication failed with 'scality'. Assuming password has already been changed.", level='VERBOSE')
-            current_password = DEFAULT_NEW_PASSWORD
+            current_password = new_password
             client.close()
         except Exception as e:
             display.display(f"An unexpected error occurred during initial connection attempt: {e}", level='ERROR')
@@ -990,12 +1581,12 @@ class Main:
                         display.display(f"Error: {error_output}", level='ERROR')
                 
                 # Set timezone
-                display.display(f"Setting timezone to '{DEFAULT_TIMEZONE}'...", level='INFO')
-                command = f"echo '{current_password}' | sudo -S timedatectl set-timezone {DEFAULT_TIMEZONE}"
+                display.display(f"Setting timezone to '{timezone}'...", level='INFO')
+                command = f"echo '{current_password}' | sudo -S timedatectl set-timezone {timezone}"
                 stdin, stdout, stderr = client.exec_command(command)
                 exit_status = stdout.channel.recv_exit_status()
                 if exit_status == 0:
-                    display.display(f"Successfully set timezone to '{DEFAULT_TIMEZONE}'.", level='VERBOSE')
+                    display.display(f"Successfully set timezone to '{timezone}'.", level='VERBOSE')
                 else:
                     error_output = stderr.read().decode('utf-8').strip()
                     display.display(f"Failed to set timezone. Exit status: {exit_status}", level='ERROR')
