@@ -21,9 +21,11 @@ DEFAULT_KEY_NAME = 'pme-aws-cloudkp' # Default key pair name for custom builds
 DEFAULT_SECURITY_GROUP_NAMES = ['allow-vpn-public-20230321165659057700000001'] # Default security group names for custom builds
 DEFAULT_SUBNET_NAME = 'scality-technical services-vpc-public-ap-northeast-1a' # Default subnet name for custom builds
 DEFAULT_VPC_NAME = 'scality-technical services-vpc' # Default VPC name for custom builds
-DEFAULT_ROOT_VOLUME_SIZE = 50 # GB
-DEFAULT_ROOT_DEVICE_NAME = '/dev/sda1' # Common for Linux AMIs, may need changing (e.g., to /dev/xvda)
 DEFAULT_LIFECYCLE_AUTOSTOP = 'nightly_ap_tokyo' # New constant for autostop tag
+
+# --- Internal Constants ---
+TEMPLATE_ROOT_VOLUME_SIZE = 50 # GB
+TEMPLATE_ROOT_DEVICE_NAME = '/dev/sda1' # Common for Linux AMIs, may need changing (e.g., to /dev/xvda)
 
 
 class EnvManager:
@@ -243,9 +245,9 @@ class AWSManager:
             
             block_device_mappings = [
                 {
-                    'DeviceName': self.config.get('root_device_name', '/dev/sda1'),
+                    'DeviceName': TEMPLATE_ROOT_DEVICE_NAME,
                     'Ebs': {
-                        'VolumeSize': self.config.get('root_volume_size', 50),
+                        'VolumeSize': TEMPLATE_ROOT_VOLUME_SIZE,
                     },
                 },
             ]
@@ -367,7 +369,7 @@ class AWSManager:
 
             disk_configs = [
                 {'count': 2, 'size': 120, 'type': 'gp3', 'name_pattern': f'{instance_name}-service-lab'},
-                {'count': 12, 'size': 8, 'type': 'standard', 'name_pattern': f'{instance_name}-data-lab'}
+                {'count': 12, 'size': 8, 'type': 'gps', 'name_pattern': f'{instance_name}-data-lab'}
             ]
 
             device_letters = 'fghijklmnopqrstuvwxyz'
@@ -635,6 +637,36 @@ class AWSManager:
             self.display.display(f"An AWS error occurred while searching for security groups: {e}", level='ERROR')
             return None
 
+    def check_key_pair(self, key_name):
+        """Checks if a key pair exists."""
+        try:
+            self.display.display(f"Checking for Key Pair: '{key_name}'", level='VERBOSE')
+            response = self.ec2.describe_key_pairs(KeyNames=[key_name])
+            if response['KeyPairs']:
+                self.display.display(f"Found Key Pair '{key_name}' (ID: {response['KeyPairs'][0]['KeyPairId']})", level='VERBOSE')
+                return True
+            return False
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'InvalidKeyPair.NotFound':
+                 self.display.display(f"Key Pair '{key_name}' not found.", level='ERROR')
+                 return False
+            self.display.display(f"An AWS error occurred while checking key pair: {e}", level='ERROR')
+            return False
+
+    def check_instance_type(self, instance_type):
+        """Checks if an instance type is valid (simple check against DescribeInstanceTypes)."""
+        try:
+             self.display.display(f"Checking validity of Instance Type: '{instance_type}'", level='VERBOSE')
+             self.ec2.describe_instance_types(InstanceTypes=[instance_type])
+             self.display.display(f"Instance Type '{instance_type}' is valid.", level='VERBOSE')
+             return True
+        except ClientError as e:
+            if e.response['Error']['Code'] == 'InvalidInstanceType':
+                 self.display.display(f"Instance Type '{instance_type}' is invalid.", level='ERROR')
+                 return False
+            self.display.display(f"An AWS error occurred while checking instance type: {e}", level='ERROR')
+            return False
+
     def get_ami_id_by_name(self, name):
         """Finds an AMI ID by its 'Name' tag."""
         try:
@@ -716,12 +748,12 @@ class AWSManager:
             self.display.display(f"Creating launch template '{template_name}' with devtype '{devtype}'...", level='INFO')
 
             # Determine root volume size based on devtype
-            root_volume_size = 100 if devtype == 'lofs' else self.config.get('root_volume_size', 50)
+            root_volume_size = 100 if devtype == 'lofs' else TEMPLATE_ROOT_VOLUME_SIZE
 
             # Define Block Device Mappings, including additional volumes
             block_device_mappings = [
                 {
-                    'DeviceName': self.config.get('root_device_name', '/dev/sda1'),
+                    'DeviceName': TEMPLATE_ROOT_DEVICE_NAME,
                     'Ebs': {
                         'VolumeSize': root_volume_size,
                     },
@@ -1098,8 +1130,9 @@ class Main:
         parser.add_argument('-z', '--availability-zone', help="The Availability Zone for resource creation.")
         
         subparsers = parser.add_subparsers(dest='command', help='Sub-command help')
-
-        # --- Build subcommand ---
+        
+        # --- Check subcommand ---
+        check_parser = subparsers.add_parser('check', help='Check the validity of environment configuration and AWS resources.')
         build_parser = subparsers.add_parser('build', help="Build machines from a template or from scratch.")
         
         # Create titled groups for better help output
@@ -1208,8 +1241,8 @@ class Main:
             'security_group_names': DEFAULT_SECURITY_GROUP_NAMES,
             'subnet_name': DEFAULT_SUBNET_NAME,
             'vpc_name': DEFAULT_VPC_NAME,
-            'root_volume_size': DEFAULT_ROOT_VOLUME_SIZE,
-            'root_device_name': DEFAULT_ROOT_DEVICE_NAME,
+            'subnet_name': DEFAULT_SUBNET_NAME,
+            'vpc_name': DEFAULT_VPC_NAME,
             'lifecycle_autostop': DEFAULT_LIFECYCLE_AUTOSTOP
         }
         env_manager = EnvManager(display, defaults)
@@ -1246,6 +1279,70 @@ class Main:
 
 
         manager = AWSManager(region=aws_region, display=display, owner=owner, config=config)
+
+        if args.command == 'check':
+            display.display("=== Checking Environment Configuration ===", level='INFO')
+
+            # --- Group 1: Client Configuration ---
+            display.raw("\n[Client Configuration]")
+            display.raw(f"  Region:       {config.get('region')}")
+            display.raw(f"  Owner:        {config.get('owner')}")
+            display.raw(f"  Timezone:     {config.get('timezone')}")
+            
+            pwd = config.get('new_password')
+            pwd_display = "******" if pwd else "Not Set"
+            display.raw(f"  New Password: {pwd_display}")
+            
+            launch_template = config.get('launch_template')
+            display.raw(f"  Launch Template Name: {launch_template}")
+
+
+            # --- Group 2: AWS Resources ---
+            display.raw("\n[AWS Resources]")
+            
+            # VPC
+            vpc_name = config.get('vpc_name')
+            vpc_id = manager.get_vpc_id_by_name(vpc_name)
+            if vpc_id:
+                display.raw(f"  [OK] VPC: {vpc_name} ({vpc_id})")
+            else:
+                display.raw(f"  [FAIL] VPC: {vpc_name} (Not Found)")
+
+            # Subnet
+            subnet_name = config.get('subnet_name')
+            subnet_id = manager.get_subnet_id_by_name(subnet_name, vpc_id=vpc_id)
+            if subnet_id:
+                display.raw(f"  [OK] Subnet: {subnet_name} ({subnet_id})")
+            else:
+                display.raw(f"  [FAIL] Subnet: {subnet_name} (Not Found)")
+
+            # Security Groups
+            sg_names = config.get('security_group_names', [])
+            sg_ids = manager.get_sg_ids_by_names(sg_names, vpc_id=vpc_id)
+            if sg_ids:
+                display.raw(f"  [OK] Security Groups: {', '.join(sg_names)} ({', '.join(sg_ids)})")
+            else:
+                display.raw(f"  [FAIL] Security Groups: {', '.join(sg_names)} (One or more not found)")
+
+            # Key Pair
+            key_name = config.get('key_name')
+            if manager.check_key_pair(key_name):
+                 display.raw(f"  [OK] Key Pair: {key_name}")
+            else:
+                 display.raw(f"  [FAIL] Key Pair: {key_name} (Not Found)")
+
+            # Instance Type
+            instance_type = config.get('instance_type')
+            if manager.check_instance_type(instance_type):
+                 display.raw(f"  [OK] Instance Type: {instance_type}")
+            else:
+                 display.raw(f"  [FAIL] Instance Type: {instance_type} (Invalid)")
+
+            # Lifecycle Autostop
+            lifecycle = config.get('lifecycle_autostop')
+            display.raw(f"  [INFO] Lifecycle Autostop Tag: {lifecycle}")
+
+            sys.exit(0)
 
         if args.command == 'build':
             prefix = args.prefix or self._generate_prefix_from_owner(owner)
@@ -1390,8 +1487,10 @@ class Main:
                     display.display(f"Skipping instance '{name}' because it has no public IP.", level='INFO')
                     continue
                 
+                private_ip = instance.get('PrivateIp')
+                
                 display.display(f"--- Configuring instance: {name} ({ip}) ---", level='INFO')
-                self._configure_instance(ip, name, display, config)
+                self._configure_instance(ip, private_ip, name, display, config)
 
         elif args.command == 'destroy':
             prefix = args.prefix or self._generate_prefix_from_owner(owner)
@@ -1493,7 +1592,7 @@ class Main:
             self.parser.print_help()
             sys.exit(1)
 
-    def _configure_instance(self, ip_address, instance_name, display, config):
+    def _configure_instance(self, ip_address, private_ip, instance_name, display, config):
         """Performs configuration (password, hostname, timezone) on a single instance."""
         if not paramiko:
             display.display("The 'paramiko' library is required for the 'configure' command.", level='ERROR')
@@ -1598,6 +1697,33 @@ class Main:
                     display.display(f"Failed to set timezone. Exit status: {exit_status}", level='ERROR')
                     if error_output:
                         display.display(f"Error: {error_output}", level='ERROR')
+
+                # Update /etc/hosts
+                entries = []
+                if private_ip and private_ip != 'N/A':
+                    entries.append((private_ip, instance_name))
+                if ip_address and ip_address != 'N/A':
+                    entries.append((ip_address, f"{instance_name}-eip"))
+
+                for ip, name in entries:
+                    display.display(f"Configuring /etc/hosts: {ip} {name}...", level='INFO')
+                    # Check if entry already exists (simple grep check)
+                    check_cmd = f"grep -q '{name}' /etc/hosts"
+                    stdin, stdout, stderr = client.exec_command(check_cmd)
+                    if stdout.channel.recv_exit_status() != 0:
+                        # Entry not found, add it
+                        # Align IP to 16 chars (standard IPv4 max len is 15)
+                        entry_line = f"{ip:<16} {name}"
+                        add_cmd = f"echo '{current_password}' | sudo -S sh -c 'echo \"{entry_line}\" >> /etc/hosts'"
+                        stdin, stdout, stderr = client.exec_command(add_cmd)
+                        exit_status = stdout.channel.recv_exit_status()
+                        if exit_status == 0:
+                            display.display(f"Successfully added '{name}' to /etc/hosts.", level='VERBOSE')
+                        else:
+                            error_output = stderr.read().decode('utf-8').strip()
+                            display.display(f"Failed to add '{name}' to /etc/hosts. Exit: {exit_status}. Error: {error_output}", level='ERROR')
+                    else:
+                        display.display(f"Entry for '{name}' already exists in /etc/hosts. Skipping.", level='VERBOSE')
                 
                 client.close()
 
