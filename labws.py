@@ -11,7 +11,8 @@ except ImportError:
 from botocore.exceptions import ClientError, NoCredentialsError, PartialCredentialsError
 
 # --- Constants ---
-DEFAULT_REGION = 'ap-northeast-1'
+ALLOWED_REGIONS = ['eu-north-1', 'us-west-2', 'ap-northeast-1', 'ap-southeast-2']
+DEFAULT_REGION = ALLOWED_REGIONS[2] # Default to ap-northeast-1 if nothing else is specified
 DEFAULT_OWNER = 'pierre.merle@scality.com'
 DEFAULT_LAUNCH_TEMPLATE = 'pme-arte-minidisk' # Hardcoded Launch Template Name
 DEFAULT_NEW_PASSWORD = "150.249.201.205ONssh:notty"
@@ -34,50 +35,64 @@ class EnvManager:
         self.display = display
         self.config_file = os.path.expanduser('~/.labws.conf')
         self.defaults = defaults
+        import configparser
+        self.parser = configparser.ConfigParser()
         self.config = self._load_config()
 
     def _load_config(self):
-        """Loads configuration, merging defaults with the config file."""
+        """Loads configuration from INI file, handling regions."""
         merged_config = self.defaults.copy()
-        if not os.path.exists(self.config_file):
-            self.display.display(f"Config file '{self.config_file}' not found. Using default values.", level='DEBUG')
-            return merged_config
+        
+        # 1. Determine active region (CLI arg not available here, so check file or default)
+        active_region = DEFAULT_REGION
+        
+        if os.path.exists(self.config_file):
+            try:
+                self.parser.read(self.config_file)
+                if 'default-region' in self.parser and 'region-name' in self.parser['default-region']:
+                    file_region = self.parser['default-region']['region-name']
+                    if file_region in ALLOWED_REGIONS:
+                        active_region = file_region
+                    else:
+                        self.display.display(f"Warning: Region '{file_region}' in config is not in allowed list {ALLOWED_REGIONS}. Using default.", level='ERROR')
+            except Exception as e:
+                self.display.display(f"Error reading config file: {e}", level='ERROR')
 
-        try:
-            with open(self.config_file, 'r') as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith('#'):
-                        continue
-                    
-                    if '=' in line:
-                        key, value = line.split('=', 1)
-                        key = key.strip()
-                        value = value.strip().strip("'\"") # Handle quotes
-                        
-                        if key in merged_config:
-                            # Convert to the same type as the default value
-                            default_type = type(self.defaults[key])
-                            try:
-                                if default_type == bool:
-                                    merged_config[key] = value.lower() in ['true', '1', 'yes']
-                                elif default_type == int:
-                                    merged_config[key] = int(value)
-                                elif default_type == list:
-                                    # Simple list parsing, assumes comma-separated values
-                                    merged_config[key] = [item.strip() for item in value.split(',')]
-                                else:
-                                    merged_config[key] = default_type(value)
-                                self.display.display(f"Loaded '{key}' from config file.", level='DEBUG')
-                            except ValueError:
-                                self.display.display(f"Warning: Could not convert value '{value}' for key '{key}'. Using default.", level='ERROR')
-                        else:
-                            self.display.display(f"Ignoring unknown key '{key}' from config file.", level='DEBUG')
-        except Exception as e:
-            self.display.display(f"Error loading config file '{self.config_file}': {e}. Using default values.", level='ERROR')
-            return self.defaults
+        # Set the region in the config
+        merged_config['region'] = active_region
+
+        # 2. Update with values from [common] section
+        if 'common' in self.parser:
+            self._update_from_section(merged_config, self.parser['common'])
+
+        # 3. Update with values from [active_region] section
+        if active_region in self.parser:
+            self.display.display(f"Loading configuration for region: {active_region}", level='DEBUG')
+            self._update_from_section(merged_config, self.parser[active_region])
 
         return merged_config
+
+    def _update_from_section(self, config_dict, section):
+        """Helper to update config dict from a configparser section."""
+        for key, value in section.items():
+            value = value.strip().strip("'\"") # Handle quotes
+            
+            if key in config_dict:
+                # Convert to the same type as the default value
+                default_type = type(self.defaults[key])
+                try:
+                    if default_type == bool:
+                        config_dict[key] = value.lower() in ['true', '1', 'yes']
+                    elif default_type == int:
+                        config_dict[key] = int(value)
+                    elif default_type == list:
+                        # Simple list parsing, assumes comma-separated values
+                        config_dict[key] = [item.strip() for item in value.split(',')]
+                    else:
+                        config_dict[key] = default_type(value)
+                    self.display.display(f"Loaded '{key}' from config.", level='DEBUG')
+                except ValueError:
+                    self.display.display(f"Warning: Could not convert value '{value}' for key '{key}'. Using default.", level='ERROR')
 
     def get_config(self):
         """Returns the merged configuration."""
@@ -85,24 +100,17 @@ class EnvManager:
 
     def show(self):
         """Displays the current configuration."""
-        self.display.display("Current effective configuration (defaults + ~/.labws.conf):", level='INFO')
+        self.display.display("Current effective configuration:", level='INFO')
+        self.display.display(f"Active Region: {self.config.get('region')}", level='INFO')
         
         # Determine max key length for alignment
         max_key_len = max(len(key) for key in self.config.keys())
         
         for key, value in sorted(self.config.items()):
-            source = "default"
-            # A bit of a hacky way to check the source, but it works for this simple case
-            if os.path.exists(self.config_file):
-                with open(self.config_file, 'r') as f:
-                    for line in f:
-                        if line.strip().startswith(key):
-                            source = "user"
-                            break
-            self.display.raw(f"  {key:<{max_key_len}} = {value}  ({source})")
+            self.display.raw(f"  {key:<{max_key_len}} = {value}")
 
     def create(self):
-        """Creates the config file with default values."""
+        """Creates the config file with INI structure."""
         if os.path.exists(self.config_file):
             self.display.display(f"WARNING: Configuration file '{self.config_file}' already exists.", level='ERROR')
             try:
@@ -119,14 +127,32 @@ class EnvManager:
             with open(self.config_file, 'w') as f:
                 f.write("# Scality Artesca Lab Workshop - User Configuration File\n")
                 f.write(f"# File automatically generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-                for key, value in self.defaults.items():
-                    # Format value based on its type
-                    if isinstance(value, str):
-                        f.write(f"{key} = '{value}'\n")
-                    elif isinstance(value, list):
-                        f.write(f"{key} = {','.join(value)}\n")
+                
+                f.write("[default-region]\n")
+                f.write(f"region-name = {DEFAULT_REGION}\n\n")
+                
+                f.write("[common]\n")
+                f.write(f"owner = {self.defaults['owner']}\n")
+                f.write(f"new_password = {self.defaults['new_password']}\n\n")
+
+                for region in ALLOWED_REGIONS:
+                    f.write(f"[{region}]\n")
+                    # Write region specific defaults as comments or active values
+                    if region == 'ap-northeast-1':
+                         f.write(f"vpc_name = {self.defaults['vpc_name']}\n")
+                         f.write(f"subnet_name = {self.defaults['subnet_name']}\n")
+                         f.write(f"security_group_names = {','.join(self.defaults['security_group_names'])}\n")
+                         f.write(f"launch_template = {self.defaults['launch_template']}\n")
+                         f.write(f"key_name = {self.defaults['key_name']}\n")
+                         f.write(f"lifecycle_autostop = {self.defaults['lifecycle_autostop']}\n")
+                         f.write(f"timezone = {self.defaults['timezone']}\n")
                     else:
-                        f.write(f"{key} = {value}\n")
+                         f.write("# vpc_name = ...\n")
+                         f.write("# subnet_name = ...\n")
+                         f.write("# security_group_names = ...\n")
+                         f.write("# launch_template = ...\n")
+                    f.write("\n")
+
             self.display.display(f"Successfully created configuration file: '{self.config_file}'", level='INFO')
         except Exception as e:
             self.display.display(f"Failed to create configuration file: {e}", level='ERROR')
