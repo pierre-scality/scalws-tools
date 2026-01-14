@@ -618,6 +618,64 @@ class AWSManager:
         except Exception as e:
             self.display.display(f"An error occurred: {e}", level='INFO')
 
+    def get_security_group_rules(self, sg_name):
+        """Retrieves inbound and outbound rules for a specific security group."""
+        try:
+            response = self.ec2.describe_security_groups(Filters=[{'Name': 'group-name', 'Values': [sg_name]}])
+            if not response['SecurityGroups']:
+                self.display.display(f"Security Group '{sg_name}' not found.", level='INFO')
+                return None
+
+            sg = response['SecurityGroups'][0]
+            rules = []
+
+            # Inbound Rules
+            for perm in sg.get('IpPermissions', []):
+                protocol = perm.get('IpProtocol', 'All')
+                if protocol == '-1': protocol = 'All'
+                port_range = 'All'
+                if 'FromPort' in perm and 'ToPort' in perm:
+                    if perm['FromPort'] == perm['ToPort']:
+                        port_range = str(perm['FromPort'])
+                    else:
+                        port_range = f"{perm['FromPort']}-{perm['ToPort']}"
+                
+                sources = []
+                for ip_range in perm.get('IpRanges', []):
+                    sources.append(ip_range.get('CidrIp'))
+                for ipv6_range in perm.get('Ipv6Ranges', []):
+                    sources.append(ipv6_range.get('CidrIpv6'))
+                for user_id_group in perm.get('UserIdGroupPairs', []):
+                    sources.append(user_id_group.get('GroupId'))
+                
+                rules.append({'Type': 'Inbound', 'Protocol': protocol, 'Port Range': port_range, 'Source': ", ".join(sources), 'Destination': 'Self'})
+
+            # Outbound Rules
+            for perm in sg.get('IpPermissionsEgress', []):
+                protocol = perm.get('IpProtocol', 'All')
+                if protocol == '-1': protocol = 'All'
+                port_range = 'All'
+                if 'FromPort' in perm and 'ToPort' in perm:
+                    if perm['FromPort'] == perm['ToPort']:
+                        port_range = str(perm['FromPort'])
+                    else:
+                        port_range = f"{perm['FromPort']}-{perm['ToPort']}"
+
+                destinations = []
+                for ip_range in perm.get('IpRanges', []):
+                    destinations.append(ip_range.get('CidrIp'))
+                for ipv6_range in perm.get('Ipv6Ranges', []):
+                    destinations.append(ipv6_range.get('CidrIpv6'))
+                for user_id_group in perm.get('UserIdGroupPairs', []):
+                    destinations.append(user_id_group.get('GroupId'))
+
+                rules.append({'Type': 'Outbound', 'Protocol': protocol, 'Port Range': port_range, 'Source': 'Self', 'Destination': ", ".join(destinations)})
+
+            return rules
+        except Exception as e:
+            self.display.display(f"An error occurred while fetching security group rules: {e}", level='INFO')
+            return None
+
 class VMMgt:
     def __init__(self, manager, display):
         self.manager = manager
@@ -739,6 +797,9 @@ class Main:
         eip_detach_parser.add_argument('ip_address', help="The IP address of the EIP to detach.")
         
         secg_parser = subparsers.add_parser('secg', help='Security Group related commands.')
+        secg_subparsers = secg_parser.add_subparsers(dest='secg_command', help='Security Group sub-command help')
+        secg_show_parser = secg_subparsers.add_parser('show', help='Show details of a security group.')
+        secg_show_parser.add_argument('--name', required=True, help="Name of the security group.")
 
         start_parser = subparsers.add_parser('start', help='Start VMs.')
         start_parser.add_argument('expressions', nargs='+', help="One or more regular expressions to match VM names.")
@@ -811,11 +872,17 @@ class Main:
 
     def do_secg(self, manager, display, args):
         display.display(f"Entering do_secg", level='DEBUG')
-        sec_groups = manager.get_security_groups_for_owned_instances()
-        if not sec_groups:
-            display.display(f"No security groups found for instances owned by {manager.owner} in region {manager.region}.", level='INFO')
+        if hasattr(args, 'secg_command') and args.secg_command == 'show':
+             rules = manager.get_security_group_rules(args.name)
+             if rules:
+                 display.display(f"Rules for Security Group: {args.name}", level='INFO')
+                 Display.format_output_table(rules)
         else:
-            Display.format_output_table(sec_groups)
+            sec_groups = manager.get_security_groups_for_owned_instances()
+            if not sec_groups:
+                display.display(f"No security groups found for instances owned by {manager.owner} in region {manager.region}.", level='INFO')
+            else:
+                Display.format_output_table(sec_groups)
 
     def do_vm_action(self, manager, display, args):
         display.display(f"Entering do_vm_action for command: {args.command}", level='DEBUG')
