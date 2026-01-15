@@ -11,18 +11,52 @@ except ImportError:
 from botocore.exceptions import ClientError, NoCredentialsError, PartialCredentialsError
 
 # --- Constants ---
+# --- Constants ---
 ALLOWED_REGIONS = ['eu-north-1', 'us-west-2', 'ap-northeast-1', 'ap-southeast-2']
-DEFAULT_REGION = ALLOWED_REGIONS[2] # Default to ap-northeast-1 if nothing else is specified
-DEFAULT_OWNER = 'pierre.merle@scality.com'
-DEFAULT_LAUNCH_TEMPLATE = 'pme-arte-minidisk' # Hardcoded Launch Template Name
-DEFAULT_NEW_PASSWORD = "150.249.201.205ONssh:notty"
-DEFAULT_TIMEZONE = 'Asia/Tokyo'
-DEFAULT_INSTANCE_TYPE = 't3.2xlarge' # Default instance type for custom builds
-DEFAULT_KEY_NAME = 'pme-aws-cloudkp' # Default key pair name for custom builds
-DEFAULT_SECURITY_GROUP_NAMES = ['allow-vpn-public-20230321165659057700000001'] # Default security group names for custom builds
-DEFAULT_SUBNET_NAME = 'scality-technical services-vpc-public-ap-northeast-1a' # Default subnet name for custom builds
-DEFAULT_VPC_NAME = 'scality-technical services-vpc' # Default VPC name for custom builds
-DEFAULT_LIFECYCLE_AUTOSTOP = 'nightly_ap_tokyo' # New constant for autostop tag
+ALLOWED_TENANTS = ['ts', 'training']
+
+# User-based Constants
+USER_REGION = ALLOWED_REGIONS[2] # Default to ap-northeast-1 if nothing else is specified
+USER_TENANT = ALLOWED_TENANTS[0] # Default to ts
+USER_OWNER = 'pierre.merle@scality.com'
+USER_LAUNCH_TEMPLATE = 'pme-arte-minidisk' # Hardcoded Launch Template Name
+USER_VM_PASSWORD = "150.249.201.205ONssh:notty"
+USER_TIMEZONE = 'Asia/Tokyo'
+
+# Region Configuration (AWS-based)
+# Structure: val = AWS_REGION_CONFIGS[region][tenant][key]
+AWS_REGION_CONFIGS = {
+    'ap-northeast-1': {
+        'ts': {
+            'instance_type': 't3.2xlarge',
+            'key_name': 'pme-aws-cloudkp',
+            'security_group_names': ['allow-vpn-public-20230321165659057700000001'],
+            'subnet_name': 'scality-technical services-vpc-public-ap-northeast-1a',
+            'vpc_name': 'scality-technical services-vpc',
+            'lifecycle_autostop': 'nightly_ap_tokyo'
+        },
+        'training': {
+            'instance_type': 't3.2xlarge',
+            'key_name': 'pme-aws-cloudkp',
+            'security_group_names': ['allow-vpn-public-20230321165659057700000001'],
+            'subnet_name': 'scality-technical services-vpc-public-ap-northeast-1a',
+            'vpc_name': 'scality-technical services-vpc',
+            'lifecycle_autostop': 'nightly_ap_tokyo'
+        }
+    },
+    'eu-north-1': {
+        'ts': { 'instance_type': None, 'key_name': None, 'security_group_names': [], 'subnet_name': None, 'vpc_name': None, 'lifecycle_autostop': None },
+        'training': { 'instance_type': None, 'key_name': None, 'security_group_names': [], 'subnet_name': None, 'vpc_name': None, 'lifecycle_autostop': None }
+    },
+    'us-west-2': {
+        'ts': { 'instance_type': None, 'key_name': None, 'security_group_names': [], 'subnet_name': None, 'vpc_name': None, 'lifecycle_autostop': None },
+        'training': { 'instance_type': None, 'key_name': None, 'security_group_names': [], 'subnet_name': None, 'vpc_name': None, 'lifecycle_autostop': None }
+    },
+    'ap-southeast-2': {
+        'ts': { 'instance_type': None, 'key_name': None, 'security_group_names': [], 'subnet_name': None, 'vpc_name': None, 'lifecycle_autostop': None },
+        'training': { 'instance_type': None, 'key_name': None, 'security_group_names': [], 'subnet_name': None, 'vpc_name': None, 'lifecycle_autostop': None }
+    }
+}
 
 # --- Internal Constants ---
 TEMPLATE_ROOT_VOLUME_SIZE = 50 # GB
@@ -31,10 +65,12 @@ TEMPLATE_ROOT_DEVICE_NAME = '/dev/sda1' # Common for Linux AMIs, may need changi
 
 class EnvManager:
     """Manages loading and saving of environment configuration from a file."""
-    def __init__(self, display, defaults):
+    def __init__(self, display, defaults, aws_region_configs, tenant=None):
         self.display = display
         self.config_file = os.path.expanduser('~/.labws.conf')
         self.defaults = defaults
+        self.aws_region_configs = aws_region_configs
+        self.tenant = tenant
         import configparser
         self.parser = configparser.ConfigParser()
         self.config = self._load_config()
@@ -44,7 +80,7 @@ class EnvManager:
         merged_config = self.defaults.copy()
         
         # 1. Determine active region (CLI arg not available here, so check file or default)
-        active_region = DEFAULT_REGION
+        active_region = USER_REGION
         
         if os.path.exists(self.config_file):
             try:
@@ -60,6 +96,25 @@ class EnvManager:
 
         # Set the region in the config
         merged_config['region'] = active_region
+
+        # 2. Update with AWS defaults for the active region and tenant
+        active_tenant = self.tenant or self.defaults.get('tenant') # Use CLI tenant or default (USER_TENANT)
+
+        if active_region in self.aws_region_configs:
+            region_config = self.aws_region_configs[active_region]
+            if active_tenant in region_config:
+                aws_defaults = region_config[active_tenant]
+                for key, value in aws_defaults.items():
+                    if value is not None:
+                        merged_config[key] = value
+                
+                # Add tenant to config for visibility
+                merged_config['tenant'] = active_tenant
+                self.display.display(f"Loaded AWS defaults for region '{active_region}' and tenant '{active_tenant}'.", level='DEBUG')
+            else:
+                 self.display.display(f"Warning: Tenant '{active_tenant}' not found in AWS_REGION_CONFIGS for region '{active_region}'.", level='ERROR')
+        else:
+             self.display.display(f"Warning: Region '{active_region}' not found in AWS_REGION_CONFIGS.", level='ERROR')
 
         # 2. Update with values from [common] section
         if 'common' in self.parser:
@@ -78,21 +133,19 @@ class EnvManager:
             value = value.strip().strip("'\"") # Handle quotes
             
             if key in config_dict:
-                # Convert to the same type as the default value
-                default_type = type(self.defaults[key])
-                try:
-                    if default_type == bool:
-                        config_dict[key] = value.lower() in ['true', '1', 'yes']
-                    elif default_type == int:
-                        config_dict[key] = int(value)
-                    elif default_type == list:
-                        # Simple list parsing, assumes comma-separated values
-                        config_dict[key] = [item.strip() for item in value.split(',')]
-                    else:
-                        config_dict[key] = default_type(value)
-                    self.display.display(f"Loaded '{key}' from config.", level='DEBUG')
-                except ValueError:
-                    self.display.display(f"Warning: Could not convert value '{value}' for key '{key}'. Using default.", level='ERROR')
+                # Determine type from existing value in config_dict
+                current_value = config_dict[key]
+                # Special handling for lists (like security groups)
+                if isinstance(current_value, list) or key == 'security_group_names':
+                     config_dict[key] = [item.strip() for item in value.split(',')]
+                elif isinstance(current_value, bool):
+                     config_dict[key] = value.lower() in ['true', '1', 'yes']
+                elif isinstance(current_value, int):
+                     config_dict[key] = int(value)
+                else:
+                     # Default to string
+                     config_dict[key] = value
+                self.display.display(f"Loaded '{key}' from config.", level='DEBUG')
 
     def get_config(self):
         """Returns the merged configuration."""
@@ -129,28 +182,24 @@ class EnvManager:
                 f.write(f"# File automatically generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
                 
                 f.write("[default-region]\n")
-                f.write(f"region-name = {DEFAULT_REGION}\n\n")
+                f.write(f"region-name = {USER_REGION}\n\n")
                 
                 f.write("[common]\n")
                 f.write(f"owner = {self.defaults['owner']}\n")
-                f.write(f"new_password = {self.defaults['new_password']}\n\n")
+                f.write(f"new_password = {self.defaults['new_password']}\n")
+                f.write(f"timezone = {self.defaults['timezone']}\n\n")
 
                 for region in ALLOWED_REGIONS:
                     f.write(f"[{region}]\n")
-                    # Write region specific defaults as comments or active values
-                    if region == 'ap-northeast-1':
-                         f.write(f"vpc_name = {self.defaults['vpc_name']}\n")
-                         f.write(f"subnet_name = {self.defaults['subnet_name']}\n")
-                         f.write(f"security_group_names = {','.join(self.defaults['security_group_names'])}\n")
-                         f.write(f"launch_template = {self.defaults['launch_template']}\n")
-                         f.write(f"key_name = {self.defaults['key_name']}\n")
-                         f.write(f"lifecycle_autostop = {self.defaults['lifecycle_autostop']}\n")
-                         f.write(f"timezone = {self.defaults['timezone']}\n")
-                    else:
-                         f.write("# vpc_name = ...\n")
-                         f.write("# subnet_name = ...\n")
-                         f.write("# security_group_names = ...\n")
-                         f.write("# launch_template = ...\n")
+                    if region in self.aws_region_configs:
+                        aws_conf = self.aws_region_configs[region]
+                        for k, v in aws_conf.items():
+                            if v is not None:
+                                if isinstance(v, list):
+                                    v = ','.join(v)
+                                f.write(f"{k} = {v}\n")
+                            else:
+                                f.write(f"# {k} = ...\n")
                     f.write("\n")
 
             self.display.display(f"Successfully created configuration file: '{self.config_file}'", level='INFO')
@@ -1155,6 +1204,8 @@ class Main:
         parser.add_argument('-o', '--owner', help="Email of the owner to filter by.")
         parser.add_argument('-z', '--availability-zone', help="The Availability Zone for resource creation.")
         
+        parser.add_argument('--tenant', choices=ALLOWED_TENANTS, help='The tenant to use (e.g., ts, training).')
+        
         subparsers = parser.add_subparsers(dest='command', help='Sub-command help')
         
         # --- Check subcommand ---
@@ -1257,21 +1308,19 @@ class Main:
 
         # --- Configuration Management ---
         defaults = {
-            'region': DEFAULT_REGION,
-            'owner': DEFAULT_OWNER,
-            'launch_template': DEFAULT_LAUNCH_TEMPLATE,
-            'new_password': DEFAULT_NEW_PASSWORD,
-            'timezone': DEFAULT_TIMEZONE,
-            'instance_type': DEFAULT_INSTANCE_TYPE,
-            'key_name': DEFAULT_KEY_NAME,
-            'security_group_names': DEFAULT_SECURITY_GROUP_NAMES,
-            'subnet_name': DEFAULT_SUBNET_NAME,
-            'vpc_name': DEFAULT_VPC_NAME,
-            'subnet_name': DEFAULT_SUBNET_NAME,
-            'vpc_name': DEFAULT_VPC_NAME,
-            'lifecycle_autostop': DEFAULT_LIFECYCLE_AUTOSTOP
+            'region': USER_REGION,
+            'tenant': USER_TENANT,
+            'owner': USER_OWNER,
+            'launch_template': USER_LAUNCH_TEMPLATE,
+            'new_password': USER_VM_PASSWORD,
+            'timezone': USER_TIMEZONE
         }
-        env_manager = EnvManager(display, defaults)
+        
+        # Determine effective tenant from CLI or defaults
+        # We pass it to EnvManager so it can load the right AWS resource IDs
+        effective_tenant = args.tenant or USER_TENANT
+
+        env_manager = EnvManager(display, defaults, AWS_REGION_CONFIGS, tenant=effective_tenant)
         config = env_manager.get_config()
 
         # Handle 'env' command first, as it doesn't need full AWS manager setup
