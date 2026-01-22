@@ -16,37 +16,43 @@ ALLOWED_REGIONS = ['eu-north-1', 'us-west-2', 'ap-northeast-1', 'ap-southeast-2'
 ALLOWED_TENANTS = ['ts', 'training']
 
 # User-based Constants
-USER_REGION = ALLOWED_REGIONS[2] # Default to ap-northeast-1 if nothing else is specified
-USER_TENANT = ALLOWED_TENANTS[0] # Default to ts
+USER_REGION = 'ap-northeast-1'
+USER_TENANT = 'ts'
 USER_OWNER = 'pierre.merle@scality.com'
 USER_LAUNCH_TEMPLATE = 'pme-arte-minidisk' # Hardcoded Launch Template Name
 USER_VM_PASSWORD = "150.249.201.205ONssh:notty"
 USER_TIMEZONE = 'Asia/Tokyo'
+USER_KEY_NAME = 'pme-aws-cloudkp'
+USER_AUTOSTOP = 'nightly_ap_tokyo'
+
+# AWS :
+AWS_INSTANCE_TYPE = 't3.2xlarge'
+AWS_VPC_NAME = 'scality-technical services-vpc'
+AWS_SUBNET_NAME = 'scality-technical services-vpc-public-ap-northeast-1a'
+AWS_SECURITY_GROUP_NAMES = ['allow-vpn-public-20230321165659057700000001']
+
+
+# Default AWS Configuration
+AWS_DEFAULT_CONFIG = {
+    'instance_type': AWS_INSTANCE_TYPE,
+    'key_name': USER_KEY_NAME,
+    'security_group_names': AWS_SECURITY_GROUP_NAMES,
+    'subnet_name': AWS_SUBNET_NAME,
+    'vpc_name': AWS_VPC_NAME,
+    'lifecycle_autostop': USER_AUTOSTOP
+}
 
 # Region Configuration (AWS-based)
 # Structure: val = AWS_REGION_CONFIGS[region][tenant][key]
+# Values here override the defaults in AWS_DEFAULT_CONFIG
 AWS_REGION_CONFIGS = {
     'ap-northeast-1': {
-        'ts': {
-            'instance_type': 't3.2xlarge',
-            'key_name': 'pme-aws-cloudkp',
-            'security_group_names': ['allow-vpn-public-20230321165659057700000001'],
-            'subnet_name': 'scality-technical services-vpc-public-ap-northeast-1a',
-            'vpc_name': 'scality-technical services-vpc',
-            'lifecycle_autostop': 'nightly_ap_tokyo'
-        },
-        'training': {
-            'instance_type': 't3.2xlarge',
-            'key_name': 'pme-aws-cloudkp',
-            'security_group_names': ['allow-vpn-public-20230321165659057700000001'],
-            'subnet_name': 'scality-technical services-vpc-public-ap-northeast-1a',
-            'vpc_name': 'scality-technical services-vpc',
-            'lifecycle_autostop': 'nightly_ap_tokyo'
-        }
+        'ts': {}, # Uses all defaults
+        'training': {'vpc_name': 'scality-training-vpc', 'subnet_name': 'scality-training-vpc-public-ap-northeast-1a', 'security_group_names': ['allow-vpn-public-20230321165619634600000001'],'key_name': 'artesca-lab-tokyo-training'}
     },
     'eu-north-1': {
         'ts': { 'instance_type': None, 'key_name': None, 'security_group_names': [], 'subnet_name': None, 'vpc_name': None, 'lifecycle_autostop': None },
-        'training': { 'instance_type': None, 'key_name': None, 'security_group_names': [], 'subnet_name': None, 'vpc_name': None, 'lifecycle_autostop': None }
+        'training': {'vpc_name': 'scality-training-vpc', 'subnet_name': 'scality-training-vpc-public-eu-north-1a', 'security_group_names': ['allow-vpn-public-20230321165617811100000001'],'key_name': 'artesca-lab-tokyo-training'}
     },
     'us-west-2': {
         'ts': { 'instance_type': None, 'key_name': None, 'security_group_names': [], 'subnet_name': None, 'vpc_name': None, 'lifecycle_autostop': None },
@@ -65,12 +71,13 @@ TEMPLATE_ROOT_DEVICE_NAME = '/dev/sda1' # Common for Linux AMIs, may need changi
 
 class EnvManager:
     """Manages loading and saving of environment configuration from a file."""
-    def __init__(self, display, defaults, aws_region_configs, tenant=None):
+    def __init__(self, display, defaults, aws_region_configs, tenant=None, region=None):
         self.display = display
         self.config_file = os.path.expanduser('~/.labws.conf')
         self.defaults = defaults
         self.aws_region_configs = aws_region_configs
         self.tenant = tenant
+        self.cli_region = region
         import configparser
         self.parser = configparser.ConfigParser()
         self.config = self._load_config()
@@ -79,42 +86,56 @@ class EnvManager:
         """Loads configuration from INI file, handling regions."""
         merged_config = self.defaults.copy()
         
-        # 1. Determine active region (CLI arg not available here, so check file or default)
-        active_region = USER_REGION
+        merged_config = self.defaults.copy()
+        
+        # 1. Determine active region (CLI arg > config file > default)
+        active_region = self.cli_region if self.cli_region else USER_REGION
         
         if os.path.exists(self.config_file):
             try:
                 self.parser.read(self.config_file)
                 if 'default-region' in self.parser and 'region-name' in self.parser['default-region']:
                     file_region = self.parser['default-region']['region-name']
-                    if file_region in ALLOWED_REGIONS:
-                        active_region = file_region
-                    else:
-                        self.display.display(f"Warning: Region '{file_region}' in config is not in allowed list {ALLOWED_REGIONS}. Using default.", level='ERROR')
+                    # Only use file region if CLI region wasn't provided
+                    if not self.cli_region:
+                         if file_region in ALLOWED_REGIONS:
+                             active_region = file_region
+                         else:
+                             self.display.display(f"Warning: Region '{file_region}' in config is not in allowed list {ALLOWED_REGIONS}. Using default.", level='ERROR')
             except Exception as e:
                 self.display.display(f"Error reading config file: {e}", level='ERROR')
 
         # Set the region in the config
         merged_config['region'] = active_region
 
-        # 2. Update with AWS defaults for the active region and tenant
+        # 2. Update with AWS defaults and region-specific overrides
+        # First, apply the global AWS defaults
         active_tenant = self.tenant or self.defaults.get('tenant') # Use CLI tenant or default (USER_TENANT)
+        
+        # Merge global defaults first
+        for key, value in AWS_DEFAULT_CONFIG.items():
+            merged_config[key] = value
 
+        # Then apply overrides from AWS_REGION_CONFIGS if they exist
         if active_region in self.aws_region_configs:
             region_config = self.aws_region_configs[active_region]
             if active_tenant in region_config:
-                aws_defaults = region_config[active_tenant]
-                for key, value in aws_defaults.items():
+                tenant_overrides = region_config[active_tenant]
+                for key, value in tenant_overrides.items():
+                    # Only override if the value is explicitly set (not None)
+                    # If you want to unset a default, you might need a specific sentinel, 
+                    # but for now we assume None means "use default" or "not configured" in the override map.
+                    # Given the diff request, we actually want defaults to be the baseline.
                     if value is not None:
-                        merged_config[key] = value
+                         merged_config[key] = value
                 
                 # Add tenant to config for visibility
                 merged_config['tenant'] = active_tenant
-                self.display.display(f"Loaded AWS defaults for region '{active_region}' and tenant '{active_tenant}'.", level='DEBUG')
+                self.display.display(f"Loaded AWS config for region '{active_region}' and tenant '{active_tenant}'.", level='DEBUG')
             else:
-                 self.display.display(f"Warning: Tenant '{active_tenant}' not found in AWS_REGION_CONFIGS for region '{active_region}'.", level='ERROR')
+                 self.display.display(f"Warning: Tenant '{active_tenant}' not found in AWS_REGION_CONFIGS for region '{active_region}'. Using global defaults.", level='ERROR')
         else:
-             self.display.display(f"Warning: Region '{active_region}' not found in AWS_REGION_CONFIGS.", level='ERROR')
+             self.display.display(f"Warning: Region '{active_region}' not found in AWS_REGION_CONFIGS. Using global defaults.", level='ERROR')
 
         # 2. Update with values from [common] section
         if 'common' in self.parser:
@@ -322,7 +343,7 @@ class AWSManager:
                 {
                     'DeviceName': TEMPLATE_ROOT_DEVICE_NAME,
                     'Ebs': {
-                        'VolumeSize': TEMPLATE_ROOT_VOLUME_SIZE,
+                        'VolumeSize': 100,
                     },
                 },
             ]
@@ -350,7 +371,7 @@ class AWSManager:
             self.display.display(f"Instance '{name}' ({instance_id}) is now running.", level='INFO')
 
             self._tag_root_volume(instance_id, name)
-            self._create_and_attach_additional_volumes(instance_id, name)
+            # self._create_and_attach_additional_volumes(instance_id, name)
 
             self.ec2.create_tags(
                 Resources=[instance_id],
@@ -838,7 +859,7 @@ class AWSManager:
             if devtype == 'device':
                 disk_configs = [
                     {'count': 2, 'size': 120, 'type': 'gp3'},
-                    {'count': 12, 'size': 8, 'type': 'standard'}
+                    {'count': 12, 'size': 8, 'type': 'gp3'}
                 ]
 
                 import string
@@ -1264,7 +1285,7 @@ class Main:
         create_template_parser = template_subparsers.add_parser('create', help='Create a new launch template from specifications.')
         create_template_parser.add_argument('--template-name', help='Name for the new template. Defaults to artelab-template-<YYYY-MM-DD>.')
         create_template_parser.add_argument('--ami-name', required=True, help="[Required] The name of the AMI.")
-        create_template_parser.add_argument('--devtype', default='lofs', choices=['device', 'lofs'], help="Disk configuration type: 'lofs' (100GB gp3) or 'device' (standard set). Default is 'lofs'.")
+        create_template_parser.add_argument('--devtype', default='lofs', choices=['device', 'lofs'], help="Disk configuration type: 'lofs' (100GB gp3) or 'device' (8GB gp3). Default is 'lofs'.")
         create_template_parser.add_argument('--instance-type', help="The instance type.")
         create_template_parser.add_argument('--key-name', help="The key pair name.")
         create_template_parser.add_argument('--security-group-names', nargs='+', help="Security group names.")
@@ -1319,8 +1340,9 @@ class Main:
         # Determine effective tenant from CLI or defaults
         # We pass it to EnvManager so it can load the right AWS resource IDs
         effective_tenant = args.tenant or USER_TENANT
+        effective_region = args.region
 
-        env_manager = EnvManager(display, defaults, AWS_REGION_CONFIGS, tenant=effective_tenant)
+        env_manager = EnvManager(display, defaults, AWS_REGION_CONFIGS, tenant=effective_tenant, region=effective_region)
         config = env_manager.get_config()
 
         # Handle 'env' command first, as it doesn't need full AWS manager setup
