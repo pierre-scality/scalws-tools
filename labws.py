@@ -19,8 +19,8 @@ ALLOWED_TENANTS = ['ts', 'training']
 USER_REGION = 'ap-northeast-1'
 USER_TENANT = 'ts'
 USER_OWNER = 'pierre.merle@scality.com'
-USER_LAUNCH_TEMPLATE = 'pme-arte-minidisk' # Hardcoded Launch Template Name
-USER_VM_PASSWORD = "150.249.201.205ONssh:notty"
+USER_LAUNCH_TEMPLATE = 'pme-arte-minidisk' 
+NEW_PASSWD = "150.249.201.205ONssh:notty"
 USER_TIMEZONE = 'Asia/Tokyo'
 USER_KEY_NAME = 'pme-aws-cloudkp'
 USER_AUTOSTOP = 'nightly_ap_tokyo'
@@ -67,6 +67,13 @@ AWS_REGION_CONFIGS = {
 # --- Internal Constants ---
 TEMPLATE_ROOT_VOLUME_SIZE = 50 # GB
 TEMPLATE_ROOT_DEVICE_NAME = '/dev/sda1' # Common for Linux AMIs, may need changing (e.g., to /dev/xvda)
+
+# SSH Configuration
+DEFAULT_SSH_USER = 'artesca-os'
+DEFAULT_SSH_PASSWORD = 'scality'
+DEFAULT_RESET_PASSWORD = NEW_PASSWD
+SSH_USER = 'root'
+SSH_PASSWD = 'scalityadmin'
 
 
 class EnvManager:
@@ -178,7 +185,7 @@ class EnvManager:
         self.display.display(f"Active Region: {self.config.get('region')}", level='INFO')
         
         # Determine max key length for alignment
-        max_key_len = max(len(key) for key in self.config.keys())
+        max_key_len = max((len(key) for key in self.config.keys()))
         
         for key, value in sorted(self.config.items()):
             self.display.raw(f"  {key:<{max_key_len}} = {value}")
@@ -311,14 +318,15 @@ class AWSManager:
 
             response = self.ec2.run_instances(**run_instances_args)
             instance_id = response['Instances'][0]['InstanceId']
-            self.display.display(f"Successfully initiated launch for instance '{instance_name}' with ID '{instance_id}'.", level='INFO')
+            self.display.display(f"Successfully initiated launch for instance '{instance_name}' with ID '{instance_id}'.", level='DEBUG')
             
             waiter = self.ec2.get_waiter('instance_running')
             waiter.wait(InstanceIds=[instance_id])
-            self.display.display(f"Instance '{instance_name}' ({instance_id}) is now running.", level='INFO')
+            self.display.display(f"Instance '{instance_name}' ({instance_id}) is now running.", level='DEBUG')
 
             self._tag_root_volume(instance_id, instance_name)
 
+            self.display.display(f"Tagging instance '{instance_name}'.", level='INFO')
             self.ec2.create_tags(
                 Resources=[instance_id],
                 Tags=[
@@ -327,7 +335,6 @@ class AWSManager:
                     {'Key': 'artesca_lab', 'Value': 'yes'}
                 ]
             )
-            self.display.display(f"Successfully tagged instance '{instance_name}'.", level='INFO')
             
             return instance_id
         except ClientError as e:
@@ -395,18 +402,18 @@ class AWSManager:
             eip_response = self.ec2.allocate_address(Domain='vpc')
             allocation_id = eip_response['AllocationId']
             public_ip = eip_response['PublicIp']
-            self.display.display(f"Successfully allocated EIP '{public_ip}'.", level='INFO')
+            self.display.display(f"Successfully allocated EIP '{public_ip}'.", level='DEBUG')
 
             eip_name = f"{instance_name}-labeip"
             self.ec2.create_tags(
                 Resources=[allocation_id],
                 Tags=[{'Key': 'Name', 'Value': eip_name}]
             )
-            self.display.display(f"Successfully tagged EIP as '{eip_name}'.", level='INFO')
+            self.display.display(f"EIP tagged as '{eip_name}'.", level='VERBOSE')
 
             self.display.display(f"Associating EIP '{public_ip}' with instance '{instance_id}'...", level='INFO')
             self.ec2.associate_address(AllocationId=allocation_id, InstanceId=instance_id)
-            self.display.display(f"Successfully associated EIP '{public_ip}' with instance '{instance_id}'.", level='INFO')
+            self.display.display(f"Successfully associated EIP '{public_ip}' with instance '{instance_id}'.", level='VERBOSE')
             
             return public_ip
         except ClientError as e:
@@ -416,7 +423,7 @@ class AWSManager:
     def _tag_root_volume(self, instance_id, instance_name):
         """Finds and tags the root volume of an instance."""
         try:
-            self.display.display(f"Finding root volume for instance '{instance_name}' to tag it...", level='VERBOSE')
+            self.display.display(f"Finding root volume for instance '{instance_name}' to tag it...", level='DEBUG')
             response = self.ec2.describe_instances(InstanceIds=[instance_id])
             
             if not response['Reservations'] or not response['Reservations'][0]['Instances']:
@@ -604,11 +611,11 @@ class AWSManager:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-        passwords_to_try = [self.config.get('new_password', '150.249.201.205ONssh:notty'), 'scality']
+        passwords_to_try = [self.config.get('new_password', DEFAULT_RESET_PASSWORD), SSH_PASSWD, DEFAULT_SSH_PASSWORD]
         
         for password in passwords_to_try:
             try:
-                client.connect(ip_address, username='artesca-os', password=password, port=22, timeout=5)
+                client.connect(ip_address, username=SSH_USER, password=password, port=22, timeout=5, look_for_keys=False, allow_agent=False)
                 
                 # Get hostname
                 stdin, stdout, stderr = client.exec_command("hostname -s", timeout=5)
@@ -806,7 +813,7 @@ class AWSManager:
     def list_shared_artesca_amis(self, show_all=False):
         """Lists AMIs shared with the current account that have names starting with 'artesca-'."""
         try:
-            self.display.display("Listing AMIs shared with this account, named 'artesca-*' ટુ...", level='INFO')
+            self.display.display("Listing AMIs shared with this account, named 'artesca-*'...", level='VERBOSE')
             response = self.ec2.describe_images(
                 Filters=[
                     {'Name': 'name', 'Values': ['artesca-*']},
@@ -838,13 +845,55 @@ class AWSManager:
             self.display.display(f"An AWS error occurred while listing shared AMIs: {e}", level='ERROR')
             return []
 
-    def create_launch_template(self, template_name, ami_id, instance_type, key_name, sg_ids, subnet_id, devtype='lofs'):
+    def _parse_version(self, name):
+        """Parses a version string like 'artesca-4.0.2' into a comparable tuple."""
+        try:
+            # tailored for 'artesca-X.Y.Z' format
+            if name.startswith('artesca-'):
+                version_part = name.split('-', 1)[1]
+                return tuple(map(int, version_part.split('.')))
+        except ValueError:
+            pass
+        return (0, 0, 0) # Fallback for non-parseable versions
+
+    def get_latest_artesca_ami(self):
+        """Returns the latest Artesca AMI based on semantic versioning."""
+        # Get all visible AMIs, filtering out dev/rc versions for stability unless we want those too?
+        # Usually 'latest' implies latest stable. Let's start with stable only (default behavior of list_shared_artesca_amis).
+        amis = self.list_shared_artesca_amis(show_all=False)
+        
+        if not amis:
+            return None
+
+        # Sort by parsed version
+        latest_ami = max(amis, key=lambda x: self._parse_version(x['Name']))
+        return latest_ami
+
+    def get_artesca_ami_by_version(self, version):
+        """Returns AMIs matching 'artesca-<version>', e.g., 'artesca-2.3.4'."""
+        try:
+            name = f"artesca-{version}"
+            response = self.ec2.describe_images(
+                Filters=[
+                    {'Name': 'name', 'Values': [name]},
+                    {'Name': 'state', 'Values': ['available']}
+                ],
+                ExecutableUsers=['self']
+            )
+            if response['Images']:
+                return response['Images'][0]
+            return None
+        except ClientError as e:
+            self.display.display(f"An AWS error occurred while searching for AMI version '{version}': {e}", level='ERROR')
+            return None
+
+    def create_launch_template(self, template_name, ami_id, instance_type, key_name, sg_ids, subnet_id, device_profile='loop'):
         """Creates a new EC2 Launch Template."""
         try:
-            self.display.display(f"Creating launch template '{template_name}' with devtype '{devtype}'...", level='INFO')
+            self.display.display(f"Creating launch template '{template_name}' with device profile '{device_profile}'...", level='INFO')
 
-            # Determine root volume size based on devtype
-            root_volume_size = 100 if devtype == 'lofs' else TEMPLATE_ROOT_VOLUME_SIZE
+            # Determine root volume size based on device_profile
+            root_volume_size = 100 if device_profile == 'loop' else TEMPLATE_ROOT_VOLUME_SIZE
 
             # Define Block Device Mappings, including additional volumes
             block_device_mappings = [
@@ -856,7 +905,7 @@ class AWSManager:
                 },
             ]
 
-            if devtype == 'device':
+            if device_profile == 'device':
                 disk_configs = [
                     {'count': 2, 'size': 120, 'type': 'gp3'},
                     {'count': 12, 'size': 8, 'type': 'gp3'}
@@ -977,23 +1026,30 @@ class AWSManager:
             return True
         except ClientError as e:
             if e.response['Error']['Code'] == 'InvalidLaunchTemplateName.NotFoundException':
-                self.display.display(f"Error: Launch template '{template_name}' not found.", level='ERROR')
+                self.display.display(f"Launch template '{template_name}' not found.", level='INFO')
             else:
                 self.display.display(f"An AWS error occurred while deleting the launch template: {e}", level='ERROR')
             return False
 
-    def get_launch_template(self, template_name):
-        """Retrieves and displays the details of a specific launch template."""
+    def get_launch_template(self, template_name, show_details=True):
+        """Retrieves and optionally displays the details of a specific launch template."""
         try:
-            self.display.display(f"Showing details for launch template '{template_name}'...", level='INFO')
+            if show_details:
+                self.display.display(f"Showing details for launch template '{template_name}'...", level='INFO')
             response = self.ec2.describe_launch_templates(LaunchTemplateNames=[template_name])
             
             if not response['LaunchTemplates']:
-                self.display.display(f"Launch template '{template_name}' not found.", level='ERROR')
+                if show_details:
+                    self.display.display(f"Launch template '{template_name}' not found.", level='ERROR')
                 return None
             
             template = response['LaunchTemplates'][0]
             
+            # If we don't need details, we can return early, but we might want the object.
+            # However, retrieving versions is an extra API call.
+            if not show_details:
+                return template
+
             # Get the latest version data
             versions_response = self.ec2.describe_launch_template_versions(
                 LaunchTemplateName=template_name,
@@ -1034,7 +1090,8 @@ class AWSManager:
 
         except ClientError as e:
             if e.response['Error']['Code'] == 'InvalidLaunchTemplateName.NotFoundException':
-                self.display.display(f"Error: Launch template '{template_name}' not found.", level='ERROR')
+                if show_details:
+                    self.display.display(f"Launch template '{template_name}' not found.", level='ERROR')
             else:
                 self.display.display(f"An AWS error occurred while describing the launch template: {e}", level='ERROR')
             return None
@@ -1151,7 +1208,7 @@ class TemplateManager:
         self.aws_manager = aws_manager
         self.display = display
 
-    def launch_instances(self, count, prefix, pattern, launch_template_name, availability_zone=None):
+    def launch_instances(self, count, prefix, pattern, launch_template_name, availability_zone=None, on_confirm_callback=None):
         """Launches a number of instances, names them, and assigns EIPs, checking for existing ones."""
         if count <= 0:
             self.display.display("Error: Number of machines to start must be greater than 0.", level='ERROR')
@@ -1195,12 +1252,16 @@ class TemplateManager:
         if confirm.lower() != 'y':
             self.display.display("Operation cancelled by user.", level='INFO')
             sys.exit(0)
+        
+        # Execute the callback (e.g. template creation) if provided
+        if on_confirm_callback:
+            on_confirm_callback()
 
         self.display.display(f"User confirmed. Preparing to launch {len(instances_to_actually_create)} instance(s).", level='INFO')
 
         for instance_to_create in instances_to_actually_create:
             instance_name = instance_to_create['Name']
-            self.display.display(f"--- Processing instance: {instance_name} ---", level='INFO')
+            self.display.display(f"Processing instance: {instance_name} ", level='VERBOSE')
             
             instance_id = self.aws_manager.launch_instance_from_template(launch_template_name, instance_name, availability_zone)
             if not instance_id:
@@ -1211,7 +1272,7 @@ class TemplateManager:
             if not public_ip:
                 self.display.display(f"Failed to create or assign EIP for instance '{instance_name}'.", level='ERROR')
             
-            self.display.display(f"Successfully launched instance '{instance_name}' and assigned Public IP '{public_ip}'.", level='INFO')
+            self.display.display(f"Successfully launched instance '{instance_name}' with assigned Public IP '{public_ip}'.", level='INFO')
 
 class Main:
     def __init__(self):
@@ -1234,24 +1295,18 @@ class Main:
         build_parser = subparsers.add_parser('build', help="Build machines from a template or from scratch.")
         
         # Create titled groups for better help output
-        generic_group = build_parser.add_argument_group('Generic Options')
-        template_group = build_parser.add_argument_group('Method 1: Build from Template')
-        scratch_group = build_parser.add_argument_group('Method 2: Build from Scratch')
+        build_group = build_parser.add_argument_group('Build Options')
 
         # Add arguments to their respective groups
-        generic_group.add_argument('-c', '--count', type=int, default=1, help="The number of machines to start. Defaults to 1.")
-        generic_group.add_argument('-x', '--prefix', help="The prefix for machine names. If not provided, it will be\ngenerated from the owner's email.")
-        generic_group.add_argument('-p', '--pattern', default='vm', help="The pattern for machine names (e.g., 'server').\nDefault is 'vm'.")
+        build_group.add_argument('-c', '--count', type=int, default=1, help="The number of machines to start. Defaults to 1.")
+        build_group.add_argument('-x', '--prefix', help="The prefix for machine names. If not provided, it will be\ngenerated from the owner's email.")
+        build_group.add_argument('-p', '--pattern', required=True, help="The pattern for machine names (required, e.g., 'vm').")
+        
+        build_group.add_argument('-t', '--template', help="Use an specific existing launch template by name.")
 
-        template_group.add_argument('-t', '--template', nargs='?', const=True, default=None,
-                                help="Use this method to build from a template. If a template\nname is provided, it's used. If the flag is used without a\nname, the default from config is used.")
-
-        scratch_group.add_argument('--ami-name', help="The name of the AMI. Required for 'from-scratch' build.")
-        scratch_group.add_argument('--instance-type', help="The instance type.")
-        scratch_group.add_argument('--key-name', help="The key pair name.")
-        scratch_group.add_argument('--security-group-names', nargs='+', help="Security group names.")
-        scratch_group.add_argument('--subnet-name', help="The subnet name.")
-        scratch_group.add_argument('--vpc-name', help="The VPC name.")
+        # Auto-Template Options
+        build_group.add_argument('-D', '--device', default='loop', choices=['loop', 'device'], help="[Auto-Template] Disk profile: 'loop' (demo profile, 100GB root) or 'device' (demolvm profile, 8GB root + extra disks). Default is 'loop'.")
+        build_group.add_argument('-A', '--artesca', help="[Auto-Template] Specific Artesca version (e.g., '2.3.4'). If not set, uses latest.")
 
         # Show subcommand
         show_parser = subparsers.add_parser('show', help='Show resources.')
@@ -1263,6 +1318,7 @@ class Main:
         configure_parser = subparsers.add_parser('configure', help='Configure machines based on prefix and pattern.')
         configure_parser.add_argument('-x', '--prefix', help="The prefix for the machine name. If not provided, it will be generated from the owner's email.")
         configure_parser.add_argument('-p', '--pattern', default='vm', help="The pattern for the machine name (e.g., 'server'). Default is 'vm'.")
+        configure_parser.add_argument('--os', action='store_true', help="Also change the password for the 'artesca-os' user to match the new root password.")
 
         # Destroy subcommand
         destroy_parser = subparsers.add_parser('destroy', help='Destroy machines and associated resources.')
@@ -1276,6 +1332,7 @@ class Main:
         # AMI subcommand
         ami_parser = subparsers.add_parser('ami', help='List AMIs shared with me, filtered by name.')
         ami_parser.add_argument('--all', action='store_true', help='Show all AMIs, including preview, rc, and dev versions.')
+        ami_parser.add_argument('--latest', action='store_true', help='Show only the latest stable Artesca AMI.')
 
         # Template subcommand
         template_parser = subparsers.add_parser('template', help='Manage launch templates.')
@@ -1283,9 +1340,11 @@ class Main:
 
         # template create
         create_template_parser = template_subparsers.add_parser('create', help='Create a new launch template from specifications.')
-        create_template_parser.add_argument('--template-name', help='Name for the new template. Defaults to artelab-template-<YYYY-MM-DD>.')
-        create_template_parser.add_argument('--ami-name', required=True, help="[Required] The name of the AMI.")
-        create_template_parser.add_argument('--devtype', default='lofs', choices=['device', 'lofs'], help="Disk configuration type: 'lofs' (100GB gp3) or 'device' (8GB gp3). Default is 'lofs'.")
+        create_template_parser.add_argument('--template-name', help='Name for the new template. If not provided, constructed from prefix and pattern.')
+        create_template_parser.add_argument('-x', '--prefix', help="The prefix for the template name. If not provided, generated from owner's email.")
+        create_template_parser.add_argument('-p', '--pattern', help="The pattern for the template name (required if --template-name is not set).")
+        create_template_parser.add_argument('--ami-name', help="The name of the AMI. If not provided, the latest Artesca AMI will be used.")
+        create_template_parser.add_argument('-D', '--device', default='loop', choices=['loop', 'device'], help="Disk profile: 'loop' (demo profile, 100GB root) or 'device' (demolvm profile, 8GB root + extra disks). Default is 'loop'.")
         create_template_parser.add_argument('--instance-type', help="The instance type.")
         create_template_parser.add_argument('--key-name', help="The key pair name.")
         create_template_parser.add_argument('--security-group-names', nargs='+', help="Security group names.")
@@ -1333,7 +1392,7 @@ class Main:
             'tenant': USER_TENANT,
             'owner': USER_OWNER,
             'launch_template': USER_LAUNCH_TEMPLATE,
-            'new_password': USER_VM_PASSWORD,
+            'new_password': NEW_PASSWD,
             'timezone': USER_TIMEZONE
         }
         
@@ -1344,6 +1403,7 @@ class Main:
 
         env_manager = EnvManager(display, defaults, AWS_REGION_CONFIGS, tenant=effective_tenant, region=effective_region)
         config = env_manager.get_config()
+        config['args'] = args
 
         # Handle 'env' command first, as it doesn't need full AWS manager setup
         if args.command == 'env':
@@ -1392,6 +1452,9 @@ class Main:
             
             launch_template = config.get('launch_template')
             display.raw(f"  Launch Template Name: {launch_template}")
+            
+            display.raw(f"  Configure SSH User:   {SSH_USER}")
+            display.raw(f"  Show SSH User:        {SSH_USER}")
 
 
             # --- Group 2: AWS Resources ---
@@ -1443,83 +1506,79 @@ class Main:
 
         if args.command == 'build':
             prefix = args.prefix or self._generate_prefix_from_owner(owner)
-
-            if args.template and args.ami_name:
-                display.display("Error: --template and --ami-name cannot be used together. Please choose one build method.", level='ERROR')
-                sys.exit(1)
             
-            # --- Template-based build path ---
+            # Decide template to use
+            on_confirm_callback = None
             if args.template:
-                # If --template is used without a value, args.template will be True. Use the config default.
-                template_name = args.template if isinstance(args.template, str) else config['launch_template']
-                display.display(f"Starting template-based build using template: '{template_name}'", level='INFO')
-                template_manager = TemplateManager(aws_manager=manager, display=display)
-                template_manager.launch_instances(args.count, prefix, args.pattern, template_name, availability_zone=availability_zone)
-            
-            # --- From-scratch build path ---
+                template_name = args.template
+                display.display(f"Using existing launch template: '{template_name}'", level='INFO')
             else:
-                display.display("Starting from-scratch build...", level='INFO')
-                if not args.ami_name:
-                    display.display("Error: --ami-name is required for a from-scratch build.", level='ERROR')
+                # Auto-Template Logic
+                template_name = f"{prefix}-{args.pattern}-template"
+                display.display(f"Using auto template name '{template_name}'", level='INFO')
+                
+                # Check if template already exists
+                existing_template = manager.get_launch_template(template_name, show_details=False)
+                if existing_template:
+                    display.display(f"Error: Launch template '{template_name}' already exists.", level='ERROR')
+                    display.display("Please use -t to use it, or destroy resources (-p <pattern>) to remove it.", level='ERROR')
                     sys.exit(1)
 
-                # 1. Resolve all resource names to AWS IDs once before the loop
-                display.display("Resolving specified resource names to AWS IDs...", level='INFO')
-                vpc_name = args.vpc_name or config['vpc_name']
-                subnet_name = args.subnet_name or config['subnet_name']
-                sg_names = args.security_group_names or config['security_group_names']
+                # Determine AMI
+                ami_id = None
+                if args.artesca:
+                    display.display(f"Searching for Artesca AMI version '{args.artesca}'...", level='INFO')
+                    ami = manager.get_artesca_ami_by_version(args.artesca)
+                    if ami:
+                        ami_id = ami['ImageId']
+                        display.display(f"Found AMI: {ami.get('Name')} ({ami_id})", level='INFO')
+                    else:
+                        display.display(f"Error: Could not find AMI for version '{args.artesca}'.", level='ERROR')
+                        sys.exit(1)
+                else:
+                    display.display("Fetching latest Artesca AMI...", level='VERBOSE')
+                    latest_ami = manager.get_latest_artesca_ami()
+                    if latest_ami:
+                        ami_id = latest_ami['ImageId']
+                        display.display(f"Using latest AMI: {latest_ami['Name']} ({ami_id})", level='INFO')
+                    else:
+                        display.display("Error: Could not find any Artesca AMIs.", level='ERROR')
+                        sys.exit(1)
+
+                # Resolve network resources
+                vpc_name = config['vpc_name']
+                subnet_name = config['subnet_name']
+                sg_names = config['security_group_names']
 
                 vpc_id = manager.get_vpc_id_by_name(vpc_name)
                 if not vpc_id:
-                    display.display(f"Could not resolve VPC '{vpc_name}'. Aborting.", level='ERROR')
-                    sys.exit(1)
+                     display.display(f"Could not resolve VPC '{vpc_name}'.", level='ERROR')
+                     sys.exit(1)
 
-                ami_id = manager.get_ami_id_by_name(args.ami_name)
                 subnet_id = manager.get_subnet_id_by_name(subnet_name, vpc_id=vpc_id)
                 sg_ids = manager.get_sg_ids_by_names(sg_names, vpc_id=vpc_id)
 
                 if not all([ami_id, subnet_id, sg_ids]):
-                    display.display("Could not resolve all required resources from names. Please check the arguments and the region. Aborting.", level='ERROR')
+                    display.display("Error: Could not resolve all required resources (AMI, Subnet, Security Groups).", level='ERROR')
                     sys.exit(1)
 
-                # 2. Confirm with the user before creating multiple instances
-                instance_type = args.instance_type or config['instance_type']
-                key_name = args.key_name or config['key_name']
-                
-                machine_names = ', '.join([f"{prefix}-{args.pattern}-{i:02d}" for i in range(1, args.count + 1)])
-                display.display(f"The following machines will be created: {machine_names}", level='INFO')
-                display.display(f"Using AMI '{args.ami_name}', instance type '{instance_type}', key '{key_name or 'N/A'}', subnet '{subnet_name}', and security groups '{', '.join(sg_names)}'.", level='INFO')
-
-                try:
-                    confirm = display.query("Do you want to proceed with creation? (y/n): ")
-                except KeyboardInterrupt:
-                    display.display("\nOperation cancelled by user.", level='INFO')
-                    sys.exit(1)
-                
-                if confirm.lower() != 'y':
-                    display.display("Operation cancelled by user.", level='INFO')
-                    sys.exit(0)
-
-                # 3. Loop to create each instance
-                for i in range(1, args.count + 1):
-                    instance_name = f"{prefix}-{args.pattern}-{i:02d}"
-                    display.display(f"--- Processing instance: {instance_name} ---", level='INFO')
-
-                    instance_id = manager.launch_instance_from_spec(
-                        name=instance_name,
+                # Define a callback to create the template only after confirmation
+                def create_template_callback():
+                     manager.create_launch_template(
+                        template_name=template_name,
                         ami_id=ami_id,
-                        instance_type=instance_type,
-                        key_name=key_name,
+                        instance_type=config['instance_type'],
+                        key_name=config['key_name'],
                         sg_ids=sg_ids,
-                        subnet_id=subnet_id
+                        subnet_id=subnet_id,
+                        device_profile=args.device
                     )
-                    if instance_id:
-                        public_ip = manager.create_and_assign_eip(instance_id, instance_name)
-                        if public_ip:
-                            display.display(f"Successfully launched instance '{instance_name}' and assigned Public IP '{public_ip}'.", level='INFO')
-                    else:
-                        display.display(f"Failed to launch instance '{instance_name}'. Aborting subsequent launches.", level='ERROR')
-                        break
+                on_confirm_callback = create_template_callback
+
+            # Proceed with build using the template (existing or to be created)
+            display.display(f"Starting build process using template: '{template_name}'", level='INFO')
+            template_manager = TemplateManager(aws_manager=manager, display=display)
+            template_manager.launch_instances(args.count, prefix, args.pattern, template_name, availability_zone=availability_zone, on_confirm_callback=on_confirm_callback)
         
         elif args.command == 'show':
             # If no prefix, pattern or eip flag is given, show all lab instances.
@@ -1600,7 +1659,11 @@ class Main:
             eips = resources_to_destroy.get('eips', [])
             volumes = resources_to_destroy.get('volumes', [])
 
-            if not instances and not eips and not volumes:
+            # Check for auto-created template
+            template_name = f"{prefix}-{pattern}-template"
+            template_to_destroy = manager.get_launch_template(template_name, show_details=False)
+
+            if not instances and not eips and not volumes and not template_to_destroy:
                 display.display("No resources found to destroy.", level='INFO')
                 sys.exit(0)
 
@@ -1614,6 +1677,8 @@ class Main:
             if volumes:
                 display.display("\n--- Volumes to Delete ---", level='INFO')
                 Display.format_output_table([{'ID': vol['VolumeId'], 'Name': vol.get('Name', 'N/A'), 'Size (GB)': vol['Size']} for vol in volumes])
+            if template_to_destroy:
+                 display.display(f"Template to delete: {template_to_destroy['LaunchTemplateName']} (ID: {template_to_destroy['LaunchTemplateId']})", level='INFO')
 
             try:
                 confirm = display.query("\nAre you sure you want to delete all these resources? This action cannot be undone. (y/n): ")
@@ -1628,12 +1693,31 @@ class Main:
             display.display("User confirmed. Proceeding with resource deletion...", level='INFO')
             manager.destroy_lab_resources(resources_to_destroy)
 
+            if template_to_destroy:
+                 display.display(f"Deleting associated template '{template_name}'...", level='INFO')
+                 manager.delete_launch_template(template_name)
+
         elif args.command == 'ami':
-            amis = manager.list_shared_artesca_amis(show_all=args.all)
-            if amis:
-                Display.format_output_table(amis)
+            if args.latest:
+                latest = manager.get_latest_artesca_ami()
+                if latest:
+                    if display.levels.get(display.level, 0) >= display.levels.get('VERBOSE', 2):
+                        display.display(f"Latest Artesca AMI: {latest['Name']} ({latest['ImageId']}) created on {latest['CreationDate']}", level='INFO')
+                    else:
+                        display.raw(latest['Name'])
+                else:
+                    display.display("No Artesca AMIs found.", level='INFO')
             else:
-                display.display("No 'artesca-*' AMIs shared with this account were found.", level='INFO')
+                amis = manager.list_shared_artesca_amis(show_all=args.all)
+                if amis:
+                    if display.levels.get(display.level, 0) >= display.levels.get('VERBOSE', 2):
+                        Display.format_output_table(amis)
+                    else:
+                        # Simplify output: keep only Name and ImageId
+                        simplified_amis = [{'Name': a['Name'], 'ImageId': a['ImageId']} for a in amis]
+                        Display.format_output_table(simplified_amis)
+                else:
+                    display.display("No 'artesca-*' AMIs shared with this account were found.", level='INFO')
 
         elif args.command == 'template':
             if args.template_command is None: # Default to list if no subcommand is provided
@@ -1644,7 +1728,16 @@ class Main:
                     display.display("No matching launch templates found.", level='INFO')
             
             elif args.template_command == 'create':
-                template_name = args.template_name or f"artelab-template-{datetime.now().strftime('%Y-%m-%d')}"
+                prefix = args.prefix or self._generate_prefix_from_owner(owner)
+                
+                if args.template_name:
+                    template_name = args.template_name
+                elif args.pattern:
+                    template_name = f"{prefix}-{args.pattern}-template"
+                else:
+                    display.display("Error: You must provide either --template-name OR a pattern (-p) to generate the name.", level='ERROR')
+                    sys.exit(1)
+
                 display.display(f"Preparing to create launch template '{template_name}'...", level='INFO')
 
                 # Resolve resource names to IDs
@@ -1657,7 +1750,21 @@ class Main:
                     display.display(f"Could not resolve VPC '{vpc_name}'. Aborting.", level='ERROR')
                     sys.exit(1)
 
-                ami_id = manager.get_ami_id_by_name(args.ami_name)
+                if args.ami_name:
+                    ami_id = manager.get_ami_id_by_name(args.ami_name)
+                    if not ami_id:
+                        display.display(f"Could not find AMI with name '{args.ami_name}'. Aborting.", level='ERROR')
+                        sys.exit(1)
+                else:
+                    display.display("No AMI name provided. Fetching latest Artesca AMI...", level='INFO')
+                    latest_ami = manager.get_latest_artesca_ami()
+                    if latest_ami:
+                         ami_id = latest_ami['ImageId']
+                         display.display(f"Using latest AMI: {latest_ami['Name']} ({ami_id})", level='INFO')
+                    else:
+                         display.display("Could not find any Artesca AMIs to use as default. Aborting.", level='ERROR')
+                         sys.exit(1)
+
                 subnet_id = manager.get_subnet_id_by_name(subnet_name, vpc_id=vpc_id)
                 sg_ids = manager.get_sg_ids_by_names(sg_names, vpc_id=vpc_id)
 
@@ -1672,7 +1779,7 @@ class Main:
                     key_name=args.key_name or config['key_name'],
                     sg_ids=sg_ids,
                     subnet_id=subnet_id,
-                    devtype=args.devtype
+                    device_profile=args.device
                 )
 
             elif args.template_command == 'delete':
@@ -1689,145 +1796,227 @@ class Main:
             self.parser.print_help()
             sys.exit(1)
 
-    def _configure_instance(self, ip_address, private_ip, instance_name, display, config):
-        """Performs configuration (password, hostname, timezone) on a single instance."""
-        if not paramiko:
-            display.display("The 'paramiko' library is required for the 'configure' command.", level='ERROR')
-            display.display("Please install it by running: pip install paramiko", level='ERROR')
-            return
-
+    def _connect_initial_mode(self, ip_address, display, config):
+        """Initial connection mode: uses root/scalityadmin, no keys, handles password change."""
         import time
-
-        def read_shell_until(shell, prompt, timeout=5):
-            """Reads from a paramiko shell until a prompt is found or timeout occurs."""
-            output = ""
+        new_password = config.get('new_password', DEFAULT_RESET_PASSWORD)
+        
+        # Helper function for reading shell output
+        def read_shell_until(shell, prompts, timeout=5, initial_buffer=""):
+            if isinstance(prompts, str):
+                prompts = [prompts]
+            output = initial_buffer
+            
+            # Check initial buffer first!
+            for p in prompts:
+                if p.lower() in output.lower():
+                    return output, True
+                    
             start_time = time.time()
             while time.time() - start_time < timeout:
                 if shell.recv_ready():
-                    output += shell.recv(1024).decode('utf-8', errors='ignore')
-                    if prompt in output:
-                        return output, True
+                    data = shell.recv(4096).decode('utf-8', errors='ignore')
+                    output += data
+                    display.display(f"[SERVER]: {data.strip()}", level='VERBOSE')
+                    for p in prompts:
+                        if p.lower() in output.lower():
+                            return output, True
                 time.sleep(0.1)
-            display.display(f"Timeout waiting for prompt: '{prompt}'", level='DEBUG')
-            display.display(f"Full shell output:\n{output}", level='DEBUG')
+            display.display(f"DEBUG: Timeout reached. Output so far: {repr(output)}", level='DEBUG')
             return output, False
 
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        current_password = None
-        new_password = config.get('new_password', '150.249.201.205ONssh:notty')
-        timezone = config.get('timezone', 'Asia/Tokyo')
-
+        
         try:
-            display.display(f"Attempting to connect to {ip_address} with initial password 'scality'...", level='INFO')
-            client.connect(ip_address, username='artesca-os', password='scality', port=22, timeout=10)
-            
-            shell = client.invoke_shell(term='vt100')
-            output, found = read_shell_until(shell, "Current password:")
-            
-            if not found:
-                display.display("No password change prompt. Assuming 'scality' is the correct, non-expired password.", level='INFO')
-                current_password = 'scality'
-            else:
-                display.display("Password change required. Proceeding with interactive change...", level='INFO')
-                shell.send("scality\n")
-                output, found = read_shell_until(shell, "New password:")
-                if not found:
-                    display.display("Did not receive 'New password:' prompt. Aborting configuration for this instance.", level='ERROR')
-                    client.close()
-                    return
+            display.display(f"Initial Mode: Connecting to {ip_address} as '{SSH_USER}'...", level='INFO')
+            # Look for keys = False, Allow Agent = False as requested
+            client.connect(
+                ip_address, 
+                username=SSH_USER, 
+                password=SSH_PASSWD, 
+                port=22, 
+                timeout=10, 
+                look_for_keys=False, 
+                allow_agent=False
+            )
 
-                shell.send(f"{new_password}\n")
-                output, found = read_shell_until(shell, "Retype new password:")
+            shell = client.invoke_shell(term='vt100')
+            time.sleep(1)
+            initial_output = ""
+            if shell.recv_ready():
+                initial_output = shell.recv(4096).decode('utf-8', errors='ignore')
+            
+            # Check for password expiry or change prompt
+            password_prompts = ["password has expired", "current password", "password:", "passwd:"]
+            if any(p in initial_output.lower() for p in password_prompts):
+                display.display("Initial Mode: Password change required.", level='INFO')
+                
+                # Wait for EITHER current password OR new password prompt
+                next_prompts = ["current password", "current unix password", "new password:", "new password", "new unix password"]
+                output, found = read_shell_until(shell, next_prompts, initial_buffer=initial_output, timeout=10)
+                
                 if not found:
-                    display.display("Did not receive 'Retype new password:' prompt. Aborting configuration for this instance.", level='ERROR')
+                    display.display("Initial Mode: Could not find password change prompt. Aborting.", level='ERROR')
+                    display.display("--- SERVER OUTPUT START ---", level='ERROR')
+                    display.display(output, level='ERROR')
+                    display.display("--- SERVER OUTPUT END ---", level='ERROR')
                     client.close()
-                    return
+                    return None
+
+                # If it's a "current password" prompt, we need to send the old password first
+                if any(p in output.lower() for p in ["current password", "current unix password"]):
+                    display.display("Initial Mode: Prompted for current password. Sending...", level='VERBOSE')
+                    shell.send(f"{SSH_PASSWD}\n")
+                    # Now wait for the "new password" prompt
+                    output, found = read_shell_until(shell, ["new password:", "new password", "new unix password"], timeout=10)
+                    if not found:
+                        display.display("Initial Mode: 'New password:' prompt not found after sending current password.", level='ERROR')
+                        display.display(f"Server output: {output}", level='ERROR')
+                        client.close()
+                        return None
+                else:
+                    display.display("Initial Mode: Skipped 'Current password' prompt, already at 'New password'.", level='VERBOSE')
+
+                # Now we are at the "New password" stage
+                display.display("Initial Mode: Sending new password...", level='VERBOSE')
+                shell.send(f"{new_password}\n")
+                
+                output, found = read_shell_until(shell, ["retype", "re-enter", "passwd:", "confirm"], timeout=10)
+                if not found:
+                    display.display("Initial Mode: 'Retype new password:' prompt not found. Aborting.", level='ERROR')
+                    display.display(f"Server output: {output}", level='ERROR')
+                    client.close()
+                    return None
                     
                 shell.send(f"{new_password}\n")
-                time.sleep(1) # Give server time to process
-                
-                display.display("Password change sequence completed. Assuming password is now the new default.", level='INFO')
-                current_password = new_password
+                time.sleep(1)
+                display.display("Initial Mode: Password change successful.", level='INFO')
+            else:
+                display.display("Initial Mode: No password change required.", level='INFO')
+            
+            client.close()
+            return new_password
+
+        except paramiko.AuthenticationException:
+            display.display(f"Initial Mode: Authentication failed for '{SSH_USER}'. Assuming already configured.", level='VERBOSE')
+            return new_password # Assume it's already set to new_password
+        except Exception as e:
+            display.display(f"Initial Mode: Connection error: {e}", level='ERROR')
+            return None
+
+    def _configure_instance(self, ip_address, private_ip, instance_name, display, config):
+        """Performs configuration (password, hostname, timezone) on a single instance."""
+        if not paramiko:
+            display.display("The 'paramiko' library is required for the 'configure' command.", level='ERROR')
+            return
+
+        # Phase 1: Initial Connection and Password Handling
+        current_password = self._connect_initial_mode(ip_address, display, config)
+        if not current_password:
+            return
+
+        # Phase 2: Configuration (Hostname, Timezone, /etc/hosts)
+        timezone = config.get('timezone', 'Asia/Tokyo')
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        
+        try:
+            display.display(f"Phase 2: Connecting to {ip_address} as '{SSH_USER}' for configuration...", level='INFO')
+            client.connect(
+                ip_address, 
+                username=SSH_USER, 
+                password=current_password, 
+                port=22, 
+                timeout=10,
+                look_for_keys=False,
+                allow_agent=False
+            )
+
+            self._test_ssh_connection(client, display)
+
+            # Clean up authorized_keys to allow direct root login
+            display.display("modifying /root/.ssh/authorized_keys", level='INFO')
+            sed_command = "sed -i 's/.*\\(ssh-ed25519\\|ssh-rsa\\|ssh-dss\\|ecdsa-sha2-nistp256\\)/\\1/' /root/.ssh/authorized_keys"
+            stdin, stdout, stderr = client.exec_command(sed_command)
+            exit_status = stdout.channel.recv_exit_status()
+            if exit_status == 0:
+                display.display("Successfully cleaned up /root/.ssh/authorized_keys.", level='DEBUG')
+            else:
+                err = stderr.read().decode('utf-8').strip()
+                display.display(f"Failed to clean up authorized_keys: {err}", level='ERROR')
+
+            # Set hostname
+            display.display(f"Setting hostname to '{instance_name}'...", level='INFO')
+            command = f"hostnamectl set-hostname {instance_name}"
+            stdin, stdout, stderr = client.exec_command(command)
+            exit_status = stdout.channel.recv_exit_status()
+            if exit_status == 0:
+                display.display(f"Successfully set hostname to '{instance_name}'.", level='VERBOSE')
+            else:
+                error_output = stderr.read().decode('utf-8').strip()
+                display.display(f"Failed to set hostname. Exit status: {exit_status}", level='ERROR')
+                if error_output:
+                    display.display(f"Error: {error_output}", level='ERROR')
+            
+            # Set timezone
+            display.display(f"Setting timezone to '{timezone}'...", level='INFO')
+            command = f"timedatectl set-timezone {timezone}"
+            stdin, stdout, stderr = client.exec_command(command)
+            exit_status = stdout.channel.recv_exit_status()
+            if exit_status == 0:
+                display.display(f"Successfully set timezone to '{timezone}'.", level='VERBOSE')
+            else:
+                error_output = stderr.read().decode('utf-8').strip()
+                display.display(f"Failed to set timezone. Exit status: {exit_status}", level='ERROR')
+                if error_output:
+                    display.display(f"Error: {error_output}", level='ERROR')
+
+            # Change artesca-os password if --os flag is present
+            if config.get('args') and getattr(config['args'], 'os', False):
+                display.display("Changing password for user 'artesca-os'...", level='INFO')
+                os_pwd_cmd = f"echo \"artesca-os:{current_password}\" | chpasswd"
+                stdin, stdout, stderr = client.exec_command(os_pwd_cmd)
+                exit_status = stdout.channel.recv_exit_status()
+                if exit_status == 0:
+                    display.display("Successfully changed password for 'artesca-os'.", level='VERBOSE')
+                else:
+                    err = stderr.read().decode('utf-8').strip()
+                    display.display(f"Failed to change artesca-os password: {err}", level='ERROR')
+
+            # Update /etc/hosts
+            entries = []
+            if private_ip and private_ip != 'N/A':
+                entries.append((private_ip, instance_name))
+            if ip_address and ip_address != 'N/A':
+                entries.append((ip_address, f"{instance_name}-eip"))
+
+            for ip, name in entries:
+                display.display(f"Configuring /etc/hosts: {ip} {name}...", level='INFO')
+                # Check if entry already exists (simple grep check)
+                check_cmd = f"grep -q '{name}' /etc/hosts"
+                stdin, stdout, stderr = client.exec_command(check_cmd)
+                if stdout.channel.recv_exit_status() != 0:
+                    # Entry not found, add it
+                    # Align IP to 16 chars (standard IPv4 max len is 15)
+                    entry_line = f"{ip:<16} {name}"
+                    add_cmd = f"sh -c 'echo \"{entry_line}\" >> /etc/hosts'"
+                    stdin, stdout, stderr = client.exec_command(add_cmd)
+                    exit_status = stdout.channel.recv_exit_status()
+                    if exit_status == 0:
+                        display.display(f"Successfully added '{name}' to /etc/hosts.", level='VERBOSE')
+                    else:
+                        error_output = stderr.read().decode('utf-8').strip()
+                        display.display(f"Failed to add '{name}' to /etc/hosts. Exit: {exit_status}. Error: {error_output}", level='ERROR')
+                else:
+                    display.display(f"Entry for '{name}' already exists in /etc/hosts. Skipping.", level='VERBOSE')
             
             client.close()
 
         except paramiko.AuthenticationException:
-            display.display("Authentication failed with 'scality'. Assuming password has already been changed.", level='VERBOSE')
-            current_password = new_password
-            client.close()
+            display.display(f"Phase 2: Authentication failed with the new password. Cannot configure hostname or timezone.", level='ERROR')
         except Exception as e:
-            display.display(f"An unexpected error occurred during initial connection attempt: {e}", level='ERROR')
-            return
-
-        if current_password:
-            client = paramiko.SSHClient() # Re-initialize client for the second connection
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-            try:
-                display.display(f"Connecting to {ip_address} to configure hostname and timezone...", level='INFO')
-                client.connect(ip_address, username='artesca-os', password=current_password, port=22, timeout=10)
-
-                self._test_ssh_connection(client, display)
-
-                # Set hostname
-                display.display(f"Setting hostname to '{instance_name}'...", level='INFO')
-                command = f"echo '{current_password}' | sudo -S hostnamectl set-hostname {instance_name}"
-                stdin, stdout, stderr = client.exec_command(command)
-                exit_status = stdout.channel.recv_exit_status()
-                if exit_status == 0:
-                    display.display(f"Successfully set hostname to '{instance_name}'.", level='VERBOSE')
-                else:
-                    error_output = stderr.read().decode('utf-8').strip()
-                    display.display(f"Failed to set hostname. Exit status: {exit_status}", level='ERROR')
-                    if error_output:
-                        display.display(f"Error: {error_output}", level='ERROR')
-                
-                # Set timezone
-                display.display(f"Setting timezone to '{timezone}'...", level='INFO')
-                command = f"echo '{current_password}' | sudo -S timedatectl set-timezone {timezone}"
-                stdin, stdout, stderr = client.exec_command(command)
-                exit_status = stdout.channel.recv_exit_status()
-                if exit_status == 0:
-                    display.display(f"Successfully set timezone to '{timezone}'.", level='VERBOSE')
-                else:
-                    error_output = stderr.read().decode('utf-8').strip()
-                    display.display(f"Failed to set timezone. Exit status: {exit_status}", level='ERROR')
-                    if error_output:
-                        display.display(f"Error: {error_output}", level='ERROR')
-
-                # Update /etc/hosts
-                entries = []
-                if private_ip and private_ip != 'N/A':
-                    entries.append((private_ip, instance_name))
-                if ip_address and ip_address != 'N/A':
-                    entries.append((ip_address, f"{instance_name}-eip"))
-
-                for ip, name in entries:
-                    display.display(f"Configuring /etc/hosts: {ip} {name}...", level='INFO')
-                    # Check if entry already exists (simple grep check)
-                    check_cmd = f"grep -q '{name}' /etc/hosts"
-                    stdin, stdout, stderr = client.exec_command(check_cmd)
-                    if stdout.channel.recv_exit_status() != 0:
-                        # Entry not found, add it
-                        # Align IP to 16 chars (standard IPv4 max len is 15)
-                        entry_line = f"{ip:<16} {name}"
-                        add_cmd = f"echo '{current_password}' | sudo -S sh -c 'echo \"{entry_line}\" >> /etc/hosts'"
-                        stdin, stdout, stderr = client.exec_command(add_cmd)
-                        exit_status = stdout.channel.recv_exit_status()
-                        if exit_status == 0:
-                            display.display(f"Successfully added '{name}' to /etc/hosts.", level='VERBOSE')
-                        else:
-                            error_output = stderr.read().decode('utf-8').strip()
-                            display.display(f"Failed to add '{name}' to /etc/hosts. Exit: {exit_status}. Error: {error_output}", level='ERROR')
-                    else:
-                        display.display(f"Entry for '{name}' already exists in /etc/hosts. Skipping.", level='VERBOSE')
-                
-                client.close()
-
-            except paramiko.AuthenticationException:
-                display.display(f"Authentication failed with the new password. Cannot configure hostname or timezone.", level='ERROR')
-            except Exception as e:
-                display.display(f"An error occurred during hostname or timezone configuration: {e}", level='ERROR')
+            display.display(f"Phase 2: An error occurred during hostname or timezone configuration: {e}", level='ERROR')
 
     def _test_ssh_connection(self, client, display):
         """Tests SSH connection by executing 'hostname' command."""
