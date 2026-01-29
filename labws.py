@@ -611,27 +611,24 @@ class AWSManager:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-        passwords_to_try = [self.config.get('new_password', DEFAULT_RESET_PASSWORD), SSH_PASSWD, DEFAULT_SSH_PASSWORD]
-        
-        for password in passwords_to_try:
-            try:
-                client.connect(ip_address, username=SSH_USER, password=password, port=22, timeout=5, look_for_keys=False, allow_agent=False)
-                
-                # Get hostname
-                stdin, stdout, stderr = client.exec_command("hostname -s", timeout=5)
-                hostname = stdout.read().decode('utf-8').strip() or 'EMPTY'
-                
-                # Get timezone
-                stdin, stdout, stderr = client.exec_command("date +%Z", timeout=5)
-                timezone = stdout.read().decode('utf-8').strip() or 'EMPTY'
-                
-                client.close()
-                return hostname, timezone
-            except Exception as e:
-                self.display.display(f"SSH connection to {ip_address} with one of the passwords failed: {e}", level='DEBUG')
-                client.close()
-        
-        return 'ERROR', 'ERROR'
+        password = self.config.get('new_password', DEFAULT_RESET_PASSWORD)
+        try:
+            client.connect(ip_address, username=DEFAULT_SSH_USER, password=password, port=22, timeout=3, look_for_keys=True, allow_agent=True)
+            
+            # Get hostname
+            stdin, stdout, stderr = client.exec_command("hostname -s", timeout=5)
+            hostname = stdout.read().decode('utf-8').strip() or 'EMPTY'
+            
+            # Get timezone
+            stdin, stdout, stderr = client.exec_command("date +%Z", timeout=5)
+            timezone = stdout.read().decode('utf-8').strip() or 'EMPTY'
+            
+            client.close()
+            return hostname, timezone
+        except Exception as e:
+            self.display.display(f"SSH connection to {ip_address} as '{DEFAULT_SSH_USER}' failed: {e}", level='DEBUG')
+            client.close()
+            return 'ERROR', 'ERROR'
 
     def list_eips_by_prefix_and_pattern(self, prefix, pattern):
         """Lists EIPs that match a given prefix and pattern."""
@@ -1454,7 +1451,7 @@ class Main:
             display.raw(f"  Launch Template Name: {launch_template}")
             
             display.raw(f"  Configure SSH User:   {SSH_USER}")
-            display.raw(f"  Show SSH User:        {SSH_USER}")
+            display.raw(f"  Show SSH User:        {DEFAULT_SSH_USER}")
 
 
             # --- Group 2: AWS Resources ---
@@ -1929,8 +1926,8 @@ class Main:
                 password=current_password, 
                 port=22, 
                 timeout=10,
-                look_for_keys=False,
-                allow_agent=False
+                look_for_keys=True,
+                allow_agent=True
             )
 
             self._test_ssh_connection(client, display)
