@@ -18,7 +18,7 @@ ALLOWED_TENANTS = ['ts', 'training']
 # User-based Constants
 USER_REGION = 'ap-northeast-1'
 USER_TENANT = 'ts'
-USER_OWNER = 'pierre.merle@scality.com'
+USER_OWNER = 'ada.lovelace@scality.com'
 USER_LAUNCH_TEMPLATE = 'pme-arte-minidisk' 
 NEW_PASSWD = "150.249.201.205ONssh:notty"
 USER_TIMEZONE = 'Asia/Tokyo'
@@ -42,27 +42,27 @@ AWS_DEFAULT_CONFIG = {
     'lifecycle_autostop': USER_AUTOSTOP
 }
 
-# Region Configuration (AWS-based)
 # Structure: val = AWS_REGION_CONFIGS[region][tenant][key]
 # Values here override the defaults in AWS_DEFAULT_CONFIG
 AWS_REGION_CONFIGS = {
     'ap-northeast-1': {
-        'ts': {}, # Uses all defaults
-        'training': {'vpc_name': 'scality-training-vpc', 'subnet_name': 'scality-training-vpc-public-ap-northeast-1a', 'security_group_names': ['allow-vpn-public-20230321165619634600000001'],'key_name': 'artesca-lab-tokyo-training'}
+        'ts': { 'instance_type': None, 'key_name': None, 'security_group_names': None, 'subnet_name': 'scality-technical services-vpc-public-ap-northeast-1a', 'vpc_name': 'scality-technical services-vpc', 'lifecycle_autostop': 'nightly_ap_tokyo' },
+        'training': { 'instance_type': None, 'key_name': 'artesca-lab-tokyo-training', 'security_group_names': None, 'subnet_name': 'scality-training-vpc-public-ap-northeast-1a', 'vpc_name': 'scality-training-vpc', 'lifecycle_autostop': 'nightly_ap_tokyo' }
     },
     'eu-north-1': {
-        'ts': { 'instance_type': None, 'key_name': None, 'security_group_names': [], 'subnet_name': None, 'vpc_name': None, 'lifecycle_autostop': None },
-        'training': {'vpc_name': 'scality-training-vpc', 'subnet_name': 'scality-training-vpc-public-eu-north-1a', 'security_group_names': ['allow-vpn-public-20230321165617811100000001'],'key_name': 'artesca-lab-tokyo-training'}
+        'ts': { 'instance_type': None, 'key_name': None, 'security_group_names': None, 'subnet_name': 'scality-technical services-vpc-public-eu-north-1a', 'vpc_name': 'scality-technical services-vpc', 'lifecycle_autostop': 'nightly_eu_stockholm' },
+        'training': { 'instance_type': None, 'key_name': 'artesca-lab-stockholm-training', 'security_group_names': None, 'subnet_name': 'scality-training-vpc-public-eu-north-1a', 'vpc_name': 'scality-training-vpc', 'lifecycle_autostop': 'nightly_eu_stockholm' }
     },
     'us-west-2': {
-        'ts': { 'instance_type': None, 'key_name': None, 'security_group_names': [], 'subnet_name': None, 'vpc_name': None, 'lifecycle_autostop': None },
-        'training': { 'instance_type': None, 'key_name': None, 'security_group_names': [], 'subnet_name': None, 'vpc_name': None, 'lifecycle_autostop': None }
+        'ts': { 'instance_type': None, 'key_name': None, 'security_group_names': None, 'subnet_name': 'scality-technical services-vpc-public-us-west-2a', 'vpc_name': 'scality-technical services-vpc', 'lifecycle_autostop': 'nightly_us_oregon' },
+        'training': { 'instance_type': None, 'key_name': 'artesca-lab-oregon-training', 'security_group_names': None, 'subnet_name': 'scality-training-vpc-public-us-west-2a', 'vpc_name': 'scality-training-vpc', 'lifecycle_autostop': 'nightly_us_oregon' }
     },
     'ap-southeast-2': {
-        'ts': { 'instance_type': None, 'key_name': None, 'security_group_names': [], 'subnet_name': None, 'vpc_name': None, 'lifecycle_autostop': None },
-        'training': { 'instance_type': None, 'key_name': None, 'security_group_names': [], 'subnet_name': None, 'vpc_name': None, 'lifecycle_autostop': None }
+        'ts': { 'instance_type': None, 'key_name': None, 'security_group_names': None, 'subnet_name': 'scality-technical services-vpc-public-ap-southeast-2a', 'vpc_name': 'scality-technical services-vpc', 'lifecycle_autostop': 'nightly_ap_sydney' },
+        'training': { 'instance_type': None, 'key_name': 'artesca-lab-sydney-training', 'security_group_names': None, 'subnet_name': 'scality-training-vpc-public-ap-southeast-2a', 'vpc_name': 'scality-training-vpc', 'lifecycle_autostop': 'nightly_ap_sydney' }
     }
 }
+
 
 # --- Internal Constants ---
 TEMPLATE_ROOT_VOLUME_SIZE = 50 # GB
@@ -191,48 +191,55 @@ class EnvManager:
             self.display.raw(f"  {key:<{max_key_len}} = {value}")
 
     def create(self):
-        """Creates the config file with INI structure."""
-        if os.path.exists(self.config_file):
-            self.display.display(f"WARNING: Configuration file '{self.config_file}' already exists.", level='ERROR')
-            try:
-                confirm = self.display.query("Do you want to overwrite it? (y/n): ")
-            except KeyboardInterrupt:
-                self.display.display("\nOperation cancelled by user.", level='INFO')
-                sys.exit(1)
+        """Creates or updates the config file interactively."""
+        # Use existing config as defaults if available
+        current_region = self.config.get('region', USER_REGION)
+        current_owner = self.config.get('owner', self.defaults['owner'])
+        current_password = self.config.get('new_password', self.defaults['new_password'])
+        current_timezone = self.config.get('timezone', self.defaults['timezone'])
 
-            if confirm.lower() != 'y':
-                self.display.display("Operation cancelled.", level='INFO')
-                return
-        
+        self.display.display("=== Interactive Configuration Setup ===", level='INFO')
+        self.display.display("Press Enter to keep the current value in brackets [ ].\n", level='INFO')
+
         try:
+            region = self.display.query(f"Default Region [{current_region}]: ").strip() or current_region
+            owner = self.display.query(f"Owner Email [{current_owner}]: ").strip() or current_owner
+            password = self.display.query(f"New Password (for instances) [{current_password}]: ").strip() or current_password
+            timezone = self.display.query(f"Default Timezone [{current_timezone}]: ").strip() or current_timezone
+
+            # Validation
+            if region not in ALLOWED_REGIONS:
+                self.display.display(f"Warning: Region '{region}' is not in the allowed list {ALLOWED_REGIONS}.", level='ERROR')
+        except KeyboardInterrupt:
+            self.display.display("\nOperation cancelled by user.", level='INFO')
+            sys.exit(1)
+
+        try:
+            # We want to keep the existing file content for regional overrides if it exists
+            # but update the [default-region] and [common] sections.
+            # self.parser already has the content from _load_config.
+            
+            if not self.parser.has_section('default-region'):
+                self.parser.add_section('default-region')
+            self.parser.set('default-region', 'region-name', region)
+
+            if not self.parser.has_section('common'):
+                self.parser.add_section('common')
+            self.parser.set('common', 'owner', owner)
+            self.parser.set('common', 'new_password', password)
+            self.parser.set('common', 'timezone', timezone)
+
             with open(self.config_file, 'w') as f:
                 f.write("# Scality Artesca Lab Workshop - User Configuration File\n")
-                f.write(f"# File automatically generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-                
-                f.write("[default-region]\n")
-                f.write(f"region-name = {USER_REGION}\n\n")
-                
-                f.write("[common]\n")
-                f.write(f"owner = {self.defaults['owner']}\n")
-                f.write(f"new_password = {self.defaults['new_password']}\n")
-                f.write(f"timezone = {self.defaults['timezone']}\n\n")
+                f.write(f"# Updated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                self.parser.write(f)
 
-                for region in ALLOWED_REGIONS:
-                    f.write(f"[{region}]\n")
-                    if region in self.aws_region_configs:
-                        aws_conf = self.aws_region_configs[region]
-                        for k, v in aws_conf.items():
-                            if v is not None:
-                                if isinstance(v, list):
-                                    v = ','.join(v)
-                                f.write(f"{k} = {v}\n")
-                            else:
-                                f.write(f"# {k} = ...\n")
-                    f.write("\n")
-
-            self.display.display(f"Successfully created configuration file: '{self.config_file}'", level='INFO')
+            self.display.display(f"Successfully updated configuration file: '{self.config_file}'", level='INFO')
+            
+            # Re-load config to reflect changes immediately in memory if needed
+            self.config = self._load_config()
         except Exception as e:
-            self.display.display(f"Failed to create configuration file: {e}", level='ERROR')
+            self.display.display(f"Failed to update configuration file: {e}", level='ERROR')
 
 
 class Display:
@@ -1276,7 +1283,22 @@ class Main:
         self.parser = self._create_parser()
 
     def _create_parser(self):
-        parser = argparse.ArgumentParser(description="Script to manage lab environments on AWS using template.\nSee individual section help for details")
+        description = (
+            "Usage : \n" 
+            "This script aws instances desinged for ARTESCA to be used for lab/training\n"
+            "The workflow is build > configure and finally destroy"
+            "Instances will be named <prefix>-<pattern>-<count#>. Prefix is based from the email and pattern is mandatory with -p option"
+            "Latest artresca AMI will be deployed but ARTESCA will not be installed. "
+            "Count of machines is based on -c option, only build use -c others command will run on all build instanace with this pattern"
+            "Sample:   ./labws.py -p mylab -c 3\n. Will create 3 vm with name <prefix>-mylab-01 to 03."
+            "Configure option will set the hostnasme/timezone/root passwd ..."
+            "Create you own email/region etc with labws.py env create "
+            "Use -a x.y.z to choose artesca version and -D device to create a demolvl type format"
+        )
+        parser = argparse.ArgumentParser(
+            description=description,
+            formatter_class=argparse.RawDescriptionHelpFormatter
+        )
         parser.add_argument('-r', '--region', help="AWS region to use.")
         parser.add_argument('-v', '--verbose', action='store_true', help="Enable verbose output.")
         parser.add_argument('-d', '--debug', action='store_true', help="Enable debug output.")
@@ -1399,6 +1421,22 @@ class Main:
         effective_region = args.region
 
         env_manager = EnvManager(display, defaults, AWS_REGION_CONFIGS, tenant=effective_tenant, region=effective_region)
+        
+        # Check for missing config file at startup (only if not already running 'env create')
+        if not os.path.exists(env_manager.config_file) and args.command != 'env':
+            display.display(f"Configuration file '{env_manager.config_file}' not found.", level='INFO')
+            try:
+                confirm = display.query("Do you want to create it now? (y/n): ")
+                if confirm.lower() == 'y':
+                    env_manager.create()
+                    # Re-load config after creation
+                    config = env_manager.get_config()
+                else:
+                    display.display("Proceeding with default configuration.", level='INFO')
+            except KeyboardInterrupt:
+                display.display("\nOperation cancelled by user.", level='INFO')
+                sys.exit(1)
+
         config = env_manager.get_config()
         config['args'] = args
 
@@ -1555,7 +1593,7 @@ class Main:
                 subnet_id = manager.get_subnet_id_by_name(subnet_name, vpc_id=vpc_id)
                 sg_ids = manager.get_sg_ids_by_names(sg_names, vpc_id=vpc_id)
 
-                if not all([ami_id, subnet_id, sg_ids]):
+                if not ami_id or not subnet_id or sg_ids is None:
                     display.display("Error: Could not resolve all required resources (AMI, Subnet, Security Groups).", level='ERROR')
                     sys.exit(1)
 
@@ -1765,7 +1803,7 @@ class Main:
                 subnet_id = manager.get_subnet_id_by_name(subnet_name, vpc_id=vpc_id)
                 sg_ids = manager.get_sg_ids_by_names(sg_names, vpc_id=vpc_id)
 
-                if not all([ami_id, subnet_id, sg_ids]):
+                if not ami_id or not subnet_id or sg_ids is None:
                     display.display("Could not resolve all required resources from names. Please check the arguments and the region. Aborting.", level='ERROR')
                     sys.exit(1)
                 
